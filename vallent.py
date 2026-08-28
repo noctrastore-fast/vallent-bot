@@ -36,6 +36,7 @@ import logging
 import pytz
 from collections import defaultdict
 from typing import Optional, Union
+from types import SimpleNamespace
 
 logging.basicConfig(level=logging.INFO)
 
@@ -1128,6 +1129,76 @@ async def start_vote_webhook_server():
                     lst.remove(target_id)
                     save_config(cfg)
 
+            # ---------------- My Rank Card / Profile customization ----------------
+            # User-scoped (not guild-scoped) — mirrors `rankcolor`/`rankbg`
+            # (rank card + level-up card) and `idcardcolor`/`idcardbg`
+            # (profile ID card, kept separate) exactly, reusing the same
+            # cfg stores, the same parse_hex_color/_BG_URL_RE validation,
+            # and the same Premium gate as those commands.
+
+            def _dashboard_user_is_premium(uid: int) -> bool:
+                if user_has_premium(None, SimpleNamespace(id=uid)):
+                    return True
+                for guild in bot.guilds:
+                    if guild.id in cfg.get("premium_guilds", []) and guild.get_member(uid):
+                        return True
+                return False
+
+            def _get_customization(uid: int) -> dict:
+                suid = str(uid)
+                return {
+                    "is_premium": _dashboard_user_is_premium(uid),
+                    "rank_colors": cfg.get("premium_colors", {}).get(suid),
+                    "rank_background": cfg.get("premium_backgrounds", {}).get(suid),
+                    "profile_colors": cfg.get("profile_colors", {}).get(suid),
+                    "profile_background": cfg.get("profile_backgrounds", {}).get(suid),
+                }
+
+            def _set_gradient(uid: int, colors: Optional[list], store_key: str) -> Optional[str]:
+                if not _dashboard_user_is_premium(uid):
+                    return "Custom gradients are a Premium perk — ask the bot owner about getting Premium."
+                store = cfg.setdefault(store_key, {})
+                suid = str(uid)
+                if not colors:
+                    store.pop(suid, None)
+                    save_config(cfg)
+                    return None
+                if not (2 <= len(colors) <= 3):
+                    return "Give 2 or 3 hex colors."
+                parsed = [parse_hex_color(c) for c in colors]
+                if not all(parsed):
+                    return "That doesn't look like a valid hex color — use 6-digit hex codes like #a672ff."
+                store[suid] = [c.strip().lstrip("#") for c in colors]
+                save_config(cfg)
+                return None
+
+            def _set_background(uid: int, url: Optional[str], store_key: str) -> Optional[str]:
+                if not _dashboard_user_is_premium(uid):
+                    return "Custom backgrounds are a Premium perk — ask the bot owner about getting Premium."
+                store = cfg.setdefault(store_key, {})
+                suid = str(uid)
+                if not url:
+                    store.pop(suid, None)
+                    save_config(cfg)
+                    return None
+                if not _BG_URL_RE.match(url.strip()):
+                    return "That doesn't look like a valid direct image URL — it needs to start with http(s):// and end in .png, .jpg, .jpeg, or .webp."
+                store[suid] = url.strip()
+                save_config(cfg)
+                return None
+
+            def _set_rank_colors(uid: int, colors: Optional[list]) -> Optional[str]:
+                return _set_gradient(uid, colors, "premium_colors")
+
+            def _set_rank_background(uid: int, url: Optional[str]) -> Optional[str]:
+                return _set_background(uid, url, "premium_backgrounds")
+
+            def _set_profile_colors(uid: int, colors: Optional[list]) -> Optional[str]:
+                return _set_gradient(uid, colors, "profile_colors")
+
+            def _set_profile_background(uid: int, url: Optional[str]) -> Optional[str]:
+                return _set_background(uid, url, "profile_backgrounds")
+
             dashboard.build_dashboard_routes(
                 app,
                 client_id=str(bot.user.id),
@@ -1145,6 +1216,11 @@ async def start_vote_webhook_server():
                 set_antispam=_set_antispam,
                 add_antispam_ignore=_add_antispam_ignore,
                 remove_antispam_ignore=_remove_antispam_ignore,
+                get_customization=_get_customization,
+                set_rank_colors=_set_rank_colors,
+                set_rank_background=_set_rank_background,
+                set_profile_colors=_set_profile_colors,
+                set_profile_background=_set_profile_background,
             )
             print(f"[{BOT_NAME}] Web dashboard live at {DASHBOARD_REDIRECT_URI.rsplit('/auth/', 1)[0]}/dashboard")
         elif DASHBOARD_CLIENT_SECRET:

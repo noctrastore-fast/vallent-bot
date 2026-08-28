@@ -38,6 +38,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
 import logging
 from typing import Callable, Optional
@@ -103,6 +104,11 @@ def build_dashboard_routes(
     set_antispam: Callable[[int, dict], Optional[str]],
     add_antispam_ignore: Callable[[int, str, int], Optional[str]],
     remove_antispam_ignore: Callable[[int, str, int], None],
+    get_customization: Callable[[int], dict],
+    set_rank_colors: Callable[[int, Optional[list]], Optional[str]],
+    set_rank_background: Callable[[int, Optional[str]], Optional[str]],
+    set_profile_colors: Callable[[int, Optional[list]], Optional[str]],
+    set_profile_background: Callable[[int, Optional[str]], Optional[str]],
 ) -> None:
     """Registers every /auth, /dashboard, and /api route onto the shared
     aiohttp `app` (the same one the top.gg webhook runs on). Everything
@@ -113,6 +119,13 @@ def build_dashboard_routes(
       - get_antinuke(guild_id)       -> {"enabled", "log_channel", "punishment", "whitelist": [...], "bot_has_audit_log_perm"}
       - set_antinuke(guild_id, dict) -> applies + persists a partial update; returns an error string or None
       - add/remove_antinuke_whitelist(guild_id, user_id) -> mutate the whitelist by one user
+      - get_customization(uid)       -> {"is_premium", "rank_colors", "rank_background", "profile_colors", "profile_background"}
+        (rank_* mirrors the `rankcolor`/`rankbg` commands — rank card + level-up card;
+         profile_* mirrors `idcardcolor`/`idcardbg` — the `profile` ID card, kept separate)
+      - set_rank_colors/set_profile_colors(uid, [hex, hex, hex?] | None) -> error string or None; None removes the gradient
+      - set_rank_background/set_profile_background(uid, url | None) -> error string or None; None removes the background
+        All five are user-scoped (not guild-scoped) and are expected to enforce the Premium
+        gate themselves, exactly like the equivalent Discord commands do.
     """
 
     def _session_from_request(request: web.Request) -> Optional[dict]:
@@ -410,6 +423,90 @@ def build_dashboard_routes(
             return web.json_response({"error": "invalid_id"}, status=400)
         return web.json_response(get_antispam(int(guild_id)))
 
+    # ---------------- My Rank Card / Profile customization (user-scoped) ----------------
+    # Same validation shapes as the `rankcolor`/`rankbg`/`idcardcolor`/`idcardbg`
+    # commands: 2-3 six-digit hex colors, or a direct image URL ending in
+    # .png/.jpg/.jpeg/.webp. The injected setters own the authoritative check
+    # (and the Premium gate) — this just does cheap shape validation so bad
+    # input never even reaches them.
+    _HEX_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
+    _URL_RE = re.compile(r"^https?://\S+\.(png|jpe?g|webp)(\?\S*)?$", re.IGNORECASE)
+
+    def _parse_colors_body(body: dict):
+        """Returns (colors_or_None_or_SENTINEL_missing, error_or_None).
+        `colors: null` (or an empty list) means "remove the gradient"."""
+        if "colors" not in body:
+            return None, "missing_colors"
+        colors = body["colors"]
+        if colors is None or colors == []:
+            return None, None
+        if not isinstance(colors, list) or not (2 <= len(colors) <= 3) or not all(isinstance(c, str) for c in colors):
+            return None, "Give 2 or 3 hex colors, e.g. #A672FF."
+        if not all(_HEX_RE.match(c.strip()) for c in colors):
+            return None, "That doesn't look like a valid hex color — use 6-digit hex like #A672FF."
+        return [c.strip().lstrip("#") for c in colors], None
+
+    def _parse_url_body(body: dict):
+        if "url" not in body:
+            return None, "missing_url"
+        url = body["url"]
+        if not url:
+            return None, None
+        url = str(url).strip()
+        if not _URL_RE.match(url):
+            return None, "That doesn't look like a valid direct image URL — it must start with http(s):// and end in .png, .jpg, .jpeg, or .webp."
+        return url, None
+
+    async def api_get_customization(request: web.Request) -> web.Response:
+        sess = _session_from_request(request)
+        if not sess:
+            return web.json_response({"error": "not_logged_in"}, status=401)
+        return web.json_response(get_customization(int(sess["uid"])))
+
+    async def _handle_customization_patch(request: web.Request, kind: str) -> web.Response:
+        sess = _session_from_request(request)
+        if not sess:
+            return web.json_response({"error": "not_logged_in"}, status=401)
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+
+        uid = int(sess["uid"])
+        if kind in ("rankcolor", "idcardcolor"):
+            value, err = _parse_colors_body(body)
+            if err == "missing_colors":
+                return web.json_response({"error": "missing_colors"}, status=400)
+            if err:
+                return web.json_response({"error": err}, status=400)
+            setter = set_rank_colors if kind == "rankcolor" else set_profile_colors
+        else:
+            value, err = _parse_url_body(body)
+            if err == "missing_url":
+                return web.json_response({"error": "missing_url"}, status=400)
+            if err:
+                return web.json_response({"error": err}, status=400)
+            setter = set_rank_background if kind == "rankbg" else set_profile_background
+
+        error = setter(uid, value)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_customization(uid))
+
+    async def api_patch_rankcolor(request: web.Request) -> web.Response:
+        return await _handle_customization_patch(request, "rankcolor")
+
+    async def api_patch_rankbg(request: web.Request) -> web.Response:
+        return await _handle_customization_patch(request, "rankbg")
+
+    async def api_patch_idcardcolor(request: web.Request) -> web.Response:
+        return await _handle_customization_patch(request, "idcardcolor")
+
+    async def api_patch_idcardbg(request: web.Request) -> web.Response:
+        return await _handle_customization_patch(request, "idcardbg")
+
     # ---------------- Frontend shell ----------------
 
     async def serve_dashboard_shell(request: web.Request) -> web.Response:
@@ -419,6 +516,11 @@ def build_dashboard_routes(
     app.router.add_get("/auth/discord/callback", handle_callback)
     app.router.add_get("/auth/discord/logout", handle_logout)
     app.router.add_get("/api/me", api_me)
+    app.router.add_get("/api/me/customization", api_get_customization)
+    app.router.add_patch("/api/me/rankcolor", api_patch_rankcolor)
+    app.router.add_patch("/api/me/rankbg", api_patch_rankbg)
+    app.router.add_patch("/api/me/idcardcolor", api_patch_idcardcolor)
+    app.router.add_patch("/api/me/idcardbg", api_patch_idcardbg)
     app.router.add_get("/api/guilds/{guild_id}/leveling", api_get_leveling)
     app.router.add_patch("/api/guilds/{guild_id}/leveling", api_patch_leveling)
     app.router.add_get("/api/guilds/{guild_id}/channels", api_guild_channels)
@@ -451,14 +553,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders:wght@700;900&family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root{
-    --void:#0a0605; --surface:#130b0c; --surface-2:#1c1112; --line:rgba(245,240,236,0.09);
+    --void:#0a0605; --surface:#130b0c; --surface-2:#1c1112; --surface-3:#241618; --line:rgba(245,240,236,0.09); --line-2:rgba(245,240,236,0.16);
     --crimson:#a80f2c; --crimson-deep:#3d0010; --crimson-glow:rgba(168,15,44,0.35);
     --gold:#f5a623; --gold-glow:rgba(245,166,35,0.30);
     --ink:#f5f0ec; --muted:#a3908d; --muted-2:#6e5c5a;
+    --shadow-lg:0 26px 64px -22px rgba(0,0,0,0.68); --shadow-sm:0 10px 26px -14px rgba(0,0,0,0.55);
+    --radius-lg:16px; --radius-md:10px;
   }
   *{ margin:0; padding:0; box-sizing:border-box; }
-  body{ background:var(--void); color:var(--ink); font-family:'Outfit',sans-serif; min-height:100vh; }
+  html{ scrollbar-color: var(--surface-3) var(--void); }
+  body{
+    background:var(--void); color:var(--ink); font-family:'Outfit',sans-serif; min-height:100vh;
+    position:relative; overflow-x:hidden;
+  }
+  body::before{
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+    background-image: radial-gradient(circle at 12% 4%, var(--crimson-glow), transparent 30%),
+                       radial-gradient(circle at 92% 90%, var(--gold-glow), transparent 36%);
+    opacity:0.22;
+  }
+  nav, main{ position:relative; z-index:2; }
+  ::selection{ background:var(--crimson); color:#fff; }
+  ::-webkit-scrollbar{ width:10px; height:10px; }
+  ::-webkit-scrollbar-track{ background:var(--void); }
+  ::-webkit-scrollbar-thumb{ background:var(--surface-3); border-radius:8px; border:2px solid var(--void); }
   a{ color:inherit; text-decoration:none; }
+  a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible{ outline:2px solid var(--gold); outline-offset:2px; border-radius:4px; }
   h1,h2,.display{ font-family:'Big Shoulders',sans-serif; font-weight:900; text-transform:uppercase; }
   .mono{ font-family:'JetBrains Mono',monospace; }
   .wrap{ max-width:960px; margin:0 auto; padding:0 28px; }
@@ -470,12 +590,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .brand b{ color:var(--gold); }
   .userchip{ display:flex; align-items:center; gap:10px; font-size:13px; color:var(--muted); }
   .userchip img{ width:28px; height:28px; border-radius:50%; }
-  .btn{ display:inline-flex; align-items:center; gap:8px; padding:10px 20px; font-weight:600; font-size:13px; border-radius:6px; border:none; cursor:pointer; }
-  .btn-primary{ background:linear-gradient(135deg,var(--crimson),#5c0a1a); color:#fff; }
+  .btn{ display:inline-flex; align-items:center; gap:8px; padding:10px 20px; font-weight:600; font-size:13px; border-radius:6px; border:none; cursor:pointer;
+    position:relative; overflow:hidden; isolation:isolate; transition:transform .18s ease, box-shadow .18s ease, opacity .18s ease; }
+  .btn::before{ content:""; position:absolute; inset:0; background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,0.22) 48%,transparent 66%); transform:translateX(-130%); transition:transform .5s ease; z-index:1; pointer-events:none; }
+  .btn:hover::before{ transform:translateX(130%); }
+  .btn:hover{ transform:translateY(-1px); }
+  .btn:disabled{ opacity:0.45; cursor:not-allowed; transform:none; }
+  .btn:disabled::before{ display:none; }
+  .btn-primary{ background:linear-gradient(135deg,var(--crimson) 0%,#7a0d22 55%,#4a0714 100%); color:#fff; box-shadow:0 10px 26px -12px var(--crimson-glow); }
+  .btn-primary:hover{ box-shadow:0 16px 34px -10px var(--crimson-glow); }
   .btn-ghost{ background:transparent; border:1px solid var(--line); color:var(--ink); }
+  .btn-ghost:hover{ border-color:var(--line-2); }
+  .btn-gold{ background:linear-gradient(135deg,var(--gold),#b3760f); color:#160b02; box-shadow:0 10px 24px -12px var(--gold-glow); }
   main{ padding:56px 0 100px; }
   .loading{ text-align:center; padding:80px 0; color:var(--muted-2); font-size:14px; }
-  .login-card{ max-width:420px; margin:80px auto; text-align:center; padding:48px 32px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
+  .login-card{ max-width:420px; margin:80px auto; text-align:center; padding:48px 32px; border:1px solid var(--line); border-radius:var(--radius-lg); background:var(--surface); box-shadow:var(--shadow-lg); }
   .login-card h1{ font-size:26px; margin:18px 0 10px; }
   .login-card p{ color:var(--muted); font-size:14px; margin-bottom:28px; line-height:1.6; }
   .guild-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; margin-top:28px; }
@@ -487,7 +616,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .guild-note{ font-size:11px; color:var(--muted-2); margin-top:2px; }
   .page-title{ font-size:32px; margin-bottom:6px; }
   .page-sub{ color:var(--muted); font-size:14px; margin-bottom:36px; }
-  .sys-card{ background:var(--surface); border:1px solid var(--line); border-radius:12px; margin-bottom:14px; overflow:hidden; }
+  .sys-card{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-lg); margin-bottom:14px; overflow:hidden; box-shadow:var(--shadow-sm); transition:border-color .2s ease; }
+  .sys-card:hover{ border-color:var(--line-2); }
   .sys-card-head{ display:flex; align-items:center; gap:14px; padding:20px 24px; cursor:pointer; user-select:none; }
   .sys-card-head:hover{ background:rgba(255,255,255,0.02); }
   .sys-card-icon{ width:38px; height:38px; border-radius:9px; background:var(--surface-2); border:1px solid var(--line); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
@@ -504,7 +634,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .sys-card.open .sys-card-body{ max-height:2000px; }
   .sys-card-body-inner{ padding:4px 24px 26px; border-top:1px solid var(--line); padding-top:22px; }
 
-  .panel{ background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:28px; margin-bottom:20px; }
+  .panel{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-lg); padding:28px; margin-bottom:20px; box-shadow:var(--shadow-sm); }
   .panel-head{ display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; }
   .panel-head h2{ font-family:'Outfit',sans-serif; text-transform:none; font-weight:700; font-size:17px; letter-spacing:0; }
   .field{ margin-bottom:20px; }
@@ -527,6 +657,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .back-link{ display:inline-flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); margin-bottom:24px; }
   .back-link:hover{ color:var(--ink); }
   .soon-note{ font-size:12.5px; color:var(--muted-2); margin-top:6px; }
+  .field input[type=text], .field input[type=url]{
+    width:100%; background:var(--surface-2); border:1px solid var(--line); border-radius:6px; padding:10px 12px;
+    color:var(--ink); font-family:'Outfit',sans-serif; font-size:14px; outline:none;
+  }
+  .field input[type=text]:focus, .field input[type=url]:focus{ border-color:var(--crimson); }
+  .field input:disabled, .field select:disabled{ opacity:0.5; cursor:not-allowed; }
+
+  /* ---------- My Rank Card / customization panel ---------- */
+  .premium-banner{
+    display:flex; align-items:center; gap:14px; padding:16px 18px; border-radius:10px; margin-bottom:22px;
+    background:rgba(245,166,35,0.08); border:1px solid rgba(245,166,35,0.28);
+  }
+  .premium-banner.is-off{ background:rgba(255,255,255,0.03); border-color:var(--line); }
+  .premium-banner .pb-icon{ width:34px; height:34px; border-radius:9px; flex-shrink:0; display:flex; align-items:center; justify-content:center; background:rgba(245,166,35,0.15); }
+  .premium-banner .pb-icon svg{ width:17px; height:17px; }
+  .premium-banner .pb-text{ font-size:13px; color:var(--muted); line-height:1.5; }
+  .premium-banner .pb-text b{ color:var(--gold); }
+  .premium-banner.is-off .pb-text b{ color:var(--ink); }
+
+  .custom-subhead{ font-size:15px; font-weight:600; margin:30px 0 4px; display:flex; align-items:center; gap:8px; }
+  .custom-subhead:first-of-type{ margin-top:6px; }
+  .custom-subnote{ font-size:12.5px; color:var(--muted-2); margin-bottom:18px; }
+
+  .color-stops{ display:flex; gap:14px; flex-wrap:wrap; margin-bottom:14px; }
+  .color-stop{ display:flex; align-items:center; gap:8px; background:var(--surface-2); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .color-stop input[type=color]{
+    width:30px; height:30px; border:none; border-radius:50%; overflow:hidden; padding:0; background:none; cursor:pointer;
+  }
+  .color-stop input[type=color]::-webkit-color-swatch-wrapper{ padding:0; }
+  .color-stop input[type=color]::-webkit-color-swatch{ border:1px solid var(--line-2); border-radius:50%; }
+  .color-stop input[type=text]{ width:88px; background:transparent; border:none; color:var(--ink); font-family:'JetBrains Mono',monospace; font-size:12.5px; padding:0; outline:none; }
+  .color-stop .stop-remove{ background:transparent; border:none; color:var(--muted-2); cursor:pointer; font-size:15px; line-height:1; padding:0 2px; }
+  .color-stop .stop-remove:hover{ color:var(--crimson); }
+  .add-stop-btn{ background:transparent; border:1px dashed var(--line-2); color:var(--muted); border-radius:8px; padding:8px 16px; font-size:12.5px; cursor:pointer; }
+  .add-stop-btn:hover{ color:var(--ink); border-color:var(--muted); }
+  .add-stop-btn:disabled{ opacity:0.35; cursor:not-allowed; }
+
+  .gradient-bar{ height:44px; border-radius:8px; margin-bottom:18px; border:1px solid var(--line-2); box-shadow:inset 0 1px 3px rgba(0,0,0,0.4); }
+
+  .bg-preview{ width:100%; aspect-ratio: 934/300; border-radius:10px; border:1px solid var(--line); background:var(--surface-2) center/cover no-repeat; margin-bottom:14px; display:flex; align-items:center; justify-content:center; color:var(--muted-2); font-size:12.5px; overflow:hidden; }
+
+  .custom-divider{ height:1px; background:var(--line); margin:34px 0 6px; }
 </style>
 </head>
 <body>
@@ -540,7 +712,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 const app = document.getElementById('app');
 const navRight = document.getElementById('navRight');
 
-function el(html){ const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstChild; }
+function el(html){ const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.childNodes.length === 1 ? t.content.firstChild : t.content; }
 
 async function api(path, opts={}) {
   const res = await fetch(path, { credentials: 'same-origin', headers: {'X-Requested-With':'vallent-dashboard','Content-Type':'application/json'}, ...opts });
@@ -569,8 +741,9 @@ function renderLogin() {
   `));
 }
 
-function renderGuildPicker(me) {
+async function renderGuildPicker(me) {
   app.innerHTML = '';
+  app.appendChild(await buildCustomizationCard());
   app.appendChild(el(`<h1 class="page-title">Your Servers</h1><p class="page-sub">Pick a server to configure. Only servers where VALLENT EXS is present and you have Manage Server show as available.</p>`));
   const grid = el('<div class="guild-grid"></div>');
   me.guilds.forEach(g => {
@@ -584,6 +757,134 @@ function renderGuildPicker(me) {
     grid.appendChild(card);
   });
   app.appendChild(grid);
+}
+
+// ---------------- My Rank Card / Profile customization ----------------
+// Personal, not per-server — mirrors the bot's own `rankcolor`/`rankbg`
+// (rank card + level-up card) and `idcardcolor`/`idcardbg` (profile ID
+// card, kept separate) commands.
+
+function defaultStops(existing) {
+  if (existing && existing.length >= 2) return existing.slice(0, 3).map(c => c.replace('#', ''));
+  return ['A672FF', '20DCD2'];
+}
+
+function buildGradientEditor(guildIdLike, label, subnote, existingColors, existingBg, saveColorPath, saveBgPath, isPremium) {
+  const wrap = el(`<div></div>`);
+  wrap.appendChild(el(`<div class="custom-subhead">${label}</div><div class="custom-subnote">${subnote}</div>`));
+
+  // ---- gradient ----
+  let stops = defaultStops(existingColors);
+  const stopsBox = el(`<div class="color-stops"></div>`);
+  const bar = el(`<div class="gradient-bar"></div>`);
+  const addBtn = el(`<button type="button" class="add-stop-btn">+ Add a 3rd color</button>`);
+
+  function updateBar() {
+    bar.style.background = `linear-gradient(90deg, ${stops.map(s => '#' + s).join(', ')})`;
+    addBtn.disabled = stops.length >= 3 || !isPremium;
+  }
+
+  function renderStops() {
+    stopsBox.innerHTML = '';
+    stops.forEach((hex, idx) => {
+      const row = el(`
+        <div class="color-stop">
+          <input type="color" value="#${hex}" ${isPremium ? '' : 'disabled'}>
+          <input type="text" value="${hex}" maxlength="7" ${isPremium ? '' : 'disabled'}>
+          ${idx === 2 ? `<button type="button" class="stop-remove" title="Remove this color">&times;</button>` : ''}
+        </div>
+      `);
+      const colorInput = row.querySelector('input[type=color]');
+      const textInput = row.querySelector('input[type=text]');
+      colorInput.oninput = () => { const v = colorInput.value.replace('#','').toUpperCase(); textInput.value = v; stops[idx] = v; updateBar(); };
+      textInput.oninput = () => {
+        let v = textInput.value.replace('#','').trim();
+        if (/^[0-9A-Fa-f]{6}$/.test(v)) { colorInput.value = '#' + v; stops[idx] = v.toUpperCase(); updateBar(); }
+      };
+      const rm = row.querySelector('.stop-remove');
+      if (rm) rm.onclick = () => { stops = stops.slice(0, 2); renderStops(); updateBar(); };
+      stopsBox.appendChild(row);
+    });
+  }
+  renderStops(); updateBar();
+
+  addBtn.onclick = () => { if (stops.length < 3) { stops.push('F5A623'); renderStops(); updateBar(); } };
+
+  const gradStatus = el(`<span class="save-status"></span>`);
+  const saveGradBtn = el(`<button class="btn btn-primary btn-sm" ${isPremium ? '' : 'disabled'}>Save Gradient</button>`);
+  const removeGradBtn = el(`<button class="btn btn-ghost btn-sm" ${isPremium ? '' : 'disabled'}>Remove</button>`);
+  saveGradBtn.onclick = async () => {
+    gradStatus.textContent = 'Saving...'; gradStatus.className = 'save-status';
+    const res = await api(saveColorPath, { method: 'PATCH', body: JSON.stringify({ colors: stops.map(s => '#' + s) }) });
+    const data = await res.json();
+    if (res.ok) { gradStatus.textContent = 'Saved.'; gradStatus.className = 'save-status ok'; }
+    else { gradStatus.textContent = data.error || 'Failed to save.'; gradStatus.className = 'save-status err'; }
+  };
+  removeGradBtn.onclick = async () => {
+    gradStatus.textContent = 'Removing...'; gradStatus.className = 'save-status';
+    const res = await api(saveColorPath, { method: 'PATCH', body: JSON.stringify({ colors: null }) });
+    if (res.ok) { gradStatus.textContent = 'Removed — back to default gold.'; gradStatus.className = 'save-status ok'; }
+    else { const data = await res.json(); gradStatus.textContent = data.error || 'Failed to remove.'; gradStatus.className = 'save-status err'; }
+  };
+
+  wrap.appendChild(bar);
+  wrap.appendChild(stopsBox);
+  wrap.appendChild(addBtn);
+  wrap.appendChild(el(`<div class="save-row">${''}</div>`));
+  const gradRow = wrap.querySelector('.save-row');
+  gradRow.appendChild(saveGradBtn); gradRow.appendChild(removeGradBtn); gradRow.appendChild(gradStatus);
+
+  // ---- background ----
+  wrap.appendChild(el(`<div class="custom-subhead" style="margin-top:26px;font-size:13.5px;">Custom Background</div>`));
+  const bgPreview = el(`<div class="bg-preview">${existingBg ? '' : 'No custom background set'}</div>`);
+  if (existingBg) bgPreview.style.backgroundImage = `url('${existingBg}')`;
+  const bgInput = el(`<input type="url" placeholder="https://example.com/background.png" value="${existingBg || ''}" ${isPremium ? '' : 'disabled'}>`);
+  const bgStatus = el(`<span class="save-status"></span>`);
+  const saveBgBtn = el(`<button class="btn btn-primary btn-sm" ${isPremium ? '' : 'disabled'}>Save Background</button>`);
+  const removeBgBtn = el(`<button class="btn btn-ghost btn-sm" ${isPremium ? '' : 'disabled'}>Remove</button>`);
+  saveBgBtn.onclick = async () => {
+    bgStatus.textContent = 'Saving...'; bgStatus.className = 'save-status';
+    const res = await api(saveBgPath, { method: 'PATCH', body: JSON.stringify({ url: bgInput.value.trim() }) });
+    const data = await res.json();
+    if (res.ok) {
+      bgStatus.textContent = 'Saved.'; bgStatus.className = 'save-status ok';
+      bgPreview.style.backgroundImage = bgInput.value.trim() ? `url('${bgInput.value.trim()}')` : '';
+      bgPreview.textContent = bgInput.value.trim() ? '' : 'No custom background set';
+    } else { bgStatus.textContent = data.error || 'Failed to save.'; bgStatus.className = 'save-status err'; }
+  };
+  removeBgBtn.onclick = async () => {
+    bgStatus.textContent = 'Removing...'; bgStatus.className = 'save-status';
+    const res = await api(saveBgPath, { method: 'PATCH', body: JSON.stringify({ url: null }) });
+    if (res.ok) { bgStatus.textContent = 'Removed.'; bgStatus.className = 'save-status ok'; bgInput.value = ''; bgPreview.style.backgroundImage = ''; bgPreview.textContent = 'No custom background set'; }
+    else { const data = await res.json(); bgStatus.textContent = data.error || 'Failed to remove.'; bgStatus.className = 'save-status err'; }
+  };
+  wrap.appendChild(bgPreview);
+  wrap.appendChild(el(`<div class="field" style="margin-bottom:10px;"></div>`)).appendChild(bgInput);
+  wrap.appendChild(el(`<div class="save-row">${''}</div>`));
+  const bgRow = wrap.lastChild;
+  bgRow.appendChild(saveBgBtn); bgRow.appendChild(removeBgBtn); bgRow.appendChild(bgStatus);
+
+  return wrap;
+}
+
+async function buildCustomizationCard() {
+  const res = await api('/api/me/customization');
+  if (!res.ok) return el('<div></div>');
+  const c = await res.json();
+
+  const card = el(`<div class="panel"></div>`);
+  card.appendChild(el(`<div class="panel-head"><h2>My Rank Card &amp; Profile</h2></div>`));
+  card.appendChild(el(
+    c.is_premium
+      ? `<div class="premium-banner"><div class="pb-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="1.8"><path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2L12 16.4 5.7 21l2.3-7.2-6-4.6h7.6z"/></svg></div><div class="pb-text"><b>Premium active</b> — customize the gradient and background on your rank card, level-up card, and profile ID card below.</div></div>`
+      : `<div class="premium-banner is-off"><div class="pb-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#a3908d" stroke-width="1.8"><path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2L12 16.4 5.7 21l2.3-7.2-6-4.6h7.6z"/></svg></div><div class="pb-text">Custom gradients and backgrounds are a <b>Premium</b> perk. Ask the bot owner about getting Premium to unlock these.</div></div>`
+  ));
+
+  card.appendChild(buildGradientEditor(null, 'Rank Card & Level-Up Card', 'Applies to your `rank` card and level-up announcement card.', c.rank_colors, c.rank_background, '/api/me/rankcolor', '/api/me/rankbg', c.is_premium));
+  card.appendChild(el(`<div class="custom-divider"></div>`));
+  card.appendChild(buildGradientEditor(null, 'Profile ID Card', 'Applies to your `profile` ID card only — kept separate so it can look different from your rank card.', c.profile_colors, c.profile_background, '/api/me/idcardcolor', '/api/me/idcardbg', c.is_premium));
+
+  return card;
 }
 
 function badgeHtml(enabled) {
