@@ -142,6 +142,7 @@ def load_config() -> dict:
             "error_log_channel_id": None,  # channel where unexpected errors get auto-reported
             "status_channel_id": None,
             "votes":             {},
+            "premium_orders":    {},      # order_id(str) -> {uid, username, product, plan_id, plan_label, price, status, created_at} — submitted from the website checkout, fulfilled manually
             "payment_methods": {
                 "qris":    {"enabled": True, "image_url": "", "info": ""},
                 "bank":    {"enabled": True, "bank_name": "", "account_number": "", "account_name": ""},
@@ -182,6 +183,12 @@ def load_config() -> dict:
     data.setdefault("xp_boost",                {})  # uid(str) -> {"expiry": iso, "multiplier": float}
     data.setdefault("join_boost_last_grant",    {})  # uid(str) -> iso timestamp of last support-server-join XP boost grant (anti leave/rejoin farm)
     data.setdefault("maintenance", {"enabled": False, "reason": "", "since": None})
+    data.setdefault("premium_orders", {})       # order_id(str) -> website checkout order, fulfilled manually
+    data.setdefault("payment_methods", {
+        "qris":    {"enabled": True, "image_url": "", "info": ""},
+        "bank":    {"enabled": True, "bank_name": "", "account_number": "", "account_name": ""},
+        "ewallet": {"enabled": True, "type": "", "number": ""},
+    })
     for gid, gc in data.get("guilds", {}).items():
         _init_guild(gc)
     save_config(data)
@@ -1199,6 +1206,51 @@ async def start_vote_webhook_server():
             def _set_profile_background(uid: int, url: Optional[str]) -> Optional[str]:
                 return _set_background(uid, url, "profile_backgrounds")
 
+            def _dashboard_get_payment_methods() -> dict:
+                # Only the display fields ever reach the client — never anything
+                # secret. The bot owner fills these in with `paymentmethods`.
+                pm = cfg.get("payment_methods", {})
+                out = {}
+                for key in ("qris", "bank", "ewallet"):
+                    v = pm.get(key, {})
+                    out[key] = dict(v)
+                return out
+
+            def _create_premium_order(uid: int, username: str, product: str, plan_id: str, plan_label: str, price: str) -> str:
+                orders = cfg.setdefault("premium_orders", {})
+                order_id = f"{int(time.time())}{uid % 10000:04d}"
+                orders[order_id] = {
+                    "uid": uid,
+                    "username": username,
+                    "product": product,
+                    "plan_id": plan_id,
+                    "plan_label": plan_label,
+                    "price": price,
+                    "status": "pending",
+                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                }
+                save_config(cfg)
+
+                async def _notify_owner():
+                    try:
+                        owner = bot.get_user(bot.owner_id) or await bot.fetch_user(bot.owner_id)
+                        embed = discord.Embed(
+                            title="New Website Order",
+                            description=(
+                                f"**{username}** (`{uid}`) just requested **{product.title()} — {plan_label}** "
+                                f"(${price}) from the website checkout.\n\nUse `premiumorders` to review, then "
+                                f"`grantpremium`/`noprefix` once payment is confirmed."
+                            ),
+                            color=COLOR_WARNING,
+                        )
+                        embed.add_field(name="Order ID", value=f"`{order_id}`")
+                        await owner.send(embed=embed)
+                    except Exception:
+                        logging.warning("Failed to DM the bot owner about a new website premium order", exc_info=True)
+
+                asyncio.create_task(_notify_owner())
+                return order_id
+
             dashboard.build_dashboard_routes(
                 app,
                 client_id=str(bot.user.id),
@@ -1221,6 +1273,8 @@ async def start_vote_webhook_server():
                 set_rank_background=_set_rank_background,
                 set_profile_colors=_set_profile_colors,
                 set_profile_background=_set_profile_background,
+                get_payment_methods=_dashboard_get_payment_methods,
+                create_premium_order=_create_premium_order,
             )
             print(f"[{BOT_NAME}] Web dashboard live at {DASHBOARD_REDIRECT_URI.rsplit('/auth/', 1)[0]}/dashboard")
         elif DASHBOARD_CLIENT_SECRET:
@@ -1567,7 +1621,7 @@ async def _antispam_log(guild: discord.Guild, gc: dict, member: discord.Member, 
 # OWNER / PERMISSION HELPERS
 # ══════════════════════════════════════════════════════════════════
 
-OWNER_ONLY_CMDS = {"maintenance", "noprefix", "botrole", "grantpremium", "premiumlock", "blacklist", "vxleave", "vxservers", "vxguilds", "ownerhelp", "botstatus", "synccommands", "errorlog"}
+OWNER_ONLY_CMDS = {"maintenance", "noprefix", "botrole", "grantpremium", "premiumlock", "blacklist", "vxleave", "vxservers", "vxguilds", "ownerhelp", "botstatus", "synccommands", "errorlog", "paymentmethods", "premiumorders"}
 
 def is_owner():
     async def predicate(ctx: commands.Context) -> bool:
@@ -6246,7 +6300,120 @@ async def pfx_grantpremium(ctx, member: discord.Member = None, duration: str = "
     except Exception: pass
     await ctx.send(embed=embed)
 
-@bot.command(name="blacklist", aliases=["bl"])
+@bot.command(name="paymentmethods", aliases=["paymethod", "pm"])
+@is_owner()
+async def pfx_paymentmethods(ctx, action: str = "", *, rest: str = ""):
+    """Configure the payment info shown on the website checkout page
+    (/dashboard/checkout). Nothing here processes a real payment — it's
+    just the display info a buyer sees so they know where to send money;
+    verifying it and running `grantpremium`/`noprefix` is still manual."""
+    pm = cfg.setdefault("payment_methods", {
+        "qris":    {"enabled": True, "image_url": "", "info": ""},
+        "bank":    {"enabled": True, "bank_name": "", "account_number": "", "account_name": ""},
+        "ewallet": {"enabled": True, "type": "", "number": ""},
+    })
+    action = action.lower()
+    parts = rest.split("|") if rest else []
+    parts = [p.strip() for p in parts]
+
+    if action == "qris":
+        if not parts or not parts[0]:
+            return await ctx.send(embed=error_embed("Usage: `paymentmethods qris <image_url> [| extra info]`"))
+        if not parts[0].startswith(("http://", "https://")):
+            return await ctx.send(embed=error_embed("The first part must be a direct image URL."))
+        pm["qris"]["image_url"] = parts[0]
+        pm["qris"]["info"] = parts[1] if len(parts) > 1 else pm["qris"].get("info", "")
+        save_config(cfg)
+        return await ctx.send(embed=success_embed("QRIS payment info updated."))
+
+    elif action == "bank":
+        if len(parts) < 3:
+            return await ctx.send(embed=error_embed("Usage: `paymentmethods bank <bank name> | <account number> | <account holder name>`"))
+        pm["bank"]["bank_name"] = parts[0]
+        pm["bank"]["account_number"] = parts[1]
+        pm["bank"]["account_name"] = parts[2]
+        save_config(cfg)
+        return await ctx.send(embed=success_embed("Bank transfer info updated."))
+
+    elif action == "ewallet":
+        if len(parts) < 2:
+            return await ctx.send(embed=error_embed("Usage: `paymentmethods ewallet <type e.g. DANA/OVO/GoPay> | <number>`"))
+        pm["ewallet"]["type"] = parts[0]
+        pm["ewallet"]["number"] = parts[1]
+        save_config(cfg)
+        return await ctx.send(embed=success_embed("E-wallet info updated."))
+
+    elif action == "toggle":
+        key = (parts[0] if parts else "").lower()
+        if key not in pm:
+            return await ctx.send(embed=error_embed("Usage: `paymentmethods toggle <qris/bank/ewallet>`"))
+        pm[key]["enabled"] = not pm[key].get("enabled", True)
+        save_config(cfg)
+        state = "shown" if pm[key]["enabled"] else "hidden"
+        return await ctx.send(embed=success_embed(f"**{key}** is now **{state}** on the checkout page."))
+
+    elif action == "show":
+        lines = []
+        for key, label in (("qris", "QRIS"), ("bank", "Bank Transfer"), ("ewallet", "E-Wallet")):
+            v = pm.get(key, {})
+            state = "✅ shown" if v.get("enabled", True) else "🚫 hidden"
+            if key == "qris":
+                detail = v.get("image_url") or "*(not set)*"
+            elif key == "bank":
+                detail = f"{v.get('bank_name') or '*(not set)*'} · {v.get('account_number') or ''} · {v.get('account_name') or ''}"
+            else:
+                detail = f"{v.get('type') or '*(not set)*'} · {v.get('number') or ''}"
+            lines.append(f"**{label}** — {state}\n{detail}")
+        return await ctx.send(embed=info_embed("Payment Methods (Website Checkout)", "\n\n".join(lines)))
+
+    else:
+        await ctx.send(embed=info_embed("Payment Methods (Website Checkout)", (
+            "`paymentmethods qris <image_url> [| extra info]` — set the QRIS code shown at checkout\n"
+            "`paymentmethods bank <bank name> | <account number> | <account holder name>`\n"
+            "`paymentmethods ewallet <type> | <number>`\n"
+            "`paymentmethods toggle <qris/bank/ewallet>` — show/hide a method\n"
+            "`paymentmethods show` — view current setup\n\n"
+            "This only controls what buyers *see* on `/dashboard/checkout` — verifying payment and activating "
+            "Premium is still done by hand with `grantpremium`/`noprefix` after checking `premiumorders`."
+        )))
+
+@bot.command(name="premiumorders", aliases=["porders"])
+@is_owner_or_staff()
+async def pfx_premiumorders(ctx, action: str = "", order_id: str = ""):
+    """Review orders submitted from the website checkout and mark them
+    fulfilled once payment is confirmed and Premium/No-Prefix has been
+    granted by hand."""
+    orders = cfg.setdefault("premium_orders", {})
+    action = action.lower()
+
+    if action == "done" or action == "fulfilled":
+        if not order_id or order_id not in orders:
+            return await ctx.send(embed=error_embed("Usage: `premiumorders done <order_id>` — order not found."))
+        orders[order_id]["status"] = "fulfilled"
+        save_config(cfg)
+        return await ctx.send(embed=success_embed(f"Order `{order_id}` marked as fulfilled."))
+
+    elif action == "cancel":
+        if not order_id or order_id not in orders:
+            return await ctx.send(embed=error_embed("Usage: `premiumorders cancel <order_id>` — order not found."))
+        orders[order_id]["status"] = "cancelled"
+        save_config(cfg)
+        return await ctx.send(embed=success_embed(f"Order `{order_id}` marked as cancelled."))
+
+    else:
+        pending = {oid: o for oid, o in orders.items() if o.get("status", "pending") == "pending"}
+        if not pending:
+            return await ctx.send(embed=info_embed("Pending Website Orders", "No pending orders right now."))
+        lines = []
+        for oid, o in sorted(pending.items(), key=lambda kv: kv[1].get("created_at", ""), reverse=True)[:15]:
+            lines.append(
+                f"`{oid}` — **{o.get('username','?')}** (`{o.get('uid','?')}`) — "
+                f"{str(o.get('product','')).title()} · {o.get('plan_label','?')} · ${o.get('price','?')}"
+            )
+        lines.append("\nUse `premiumorders done <order_id>` once you've verified payment and granted access.")
+        await ctx.send(embed=info_embed(f"Pending Website Orders ({len(pending)})", "\n".join(lines)))
+
+
 @is_owner()
 async def pfx_blacklist(ctx, action: str = "", guild_id: str = ""):
     bl = cfg.setdefault("blacklisted_guilds", [])

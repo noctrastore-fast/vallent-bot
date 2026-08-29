@@ -109,6 +109,8 @@ def build_dashboard_routes(
     set_rank_background: Callable[[int, Optional[str]], Optional[str]],
     set_profile_colors: Callable[[int, Optional[list]], Optional[str]],
     set_profile_background: Callable[[int, Optional[str]], Optional[str]],
+    get_payment_methods: Callable[[], dict],
+    create_premium_order: Callable[[int, str, str, str, str, str], str],
 ) -> None:
     """Registers every /auth, /dashboard, and /api route onto the shared
     aiohttp `app` (the same one the top.gg webhook runs on). Everything
@@ -126,6 +128,15 @@ def build_dashboard_routes(
       - set_rank_background/set_profile_background(uid, url | None) -> error string or None; None removes the background
         All five are user-scoped (not guild-scoped) and are expected to enforce the Premium
         gate themselves, exactly like the equivalent Discord commands do.
+      - get_payment_methods() -> {"qris": {...}, "bank": {...}, "ewallet": {...}} — only the enabled
+        ones (and only their display fields) are meant to reach the client; the bot owner configures
+        these themselves once real payment is wired up.
+      - create_premium_order(uid, username, product, plan_id, plan_label, price) -> order_id (str).
+        Called once a logged-in user submits the checkout form on /dashboard/checkout. This is an
+        ORDER, not a confirmed payment — persisting it and (best-effort) notifying the bot owner is
+        entirely up to this callable; the actual payment verification/fulfillment stays manual
+        (the owner still runs `grantpremium`/`noprefix` themselves) until real payment processing
+        is wired up.
     """
 
     def _session_from_request(request: web.Request) -> Optional[dict]:
@@ -142,6 +153,10 @@ def build_dashboard_routes(
     # ---------------- OAuth2 login flow ----------------
 
     async def handle_login(request: web.Request) -> web.Response:
+        next_path = request.query.get("next", "")
+        # Only ever redirect back into our own /dashboard/* — never an
+        # open redirect to an arbitrary host.
+        state = next_path if next_path.startswith("/dashboard") else ""
         params = {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
@@ -149,6 +164,8 @@ def build_dashboard_routes(
             "scope": "identify guilds",
             "prompt": "none",
         }
+        if state:
+            params["state"] = state
         return web.HTTPFound(f"https://discord.com/oauth2/authorize?{urlencode(params)}")
 
     async def handle_callback(request: web.Request) -> web.Response:
@@ -206,7 +223,10 @@ def build_dashboard_routes(
             "guilds": manageable,
         }
         cookie = create_session(session_data, session_secret)
-        resp = web.HTTPFound("/dashboard")
+        dest = request.query.get("state") or "/dashboard"
+        if not dest.startswith("/dashboard"):
+            dest = "/dashboard"
+        resp = web.HTTPFound(dest)
         resp.set_cookie(SESSION_COOKIE, cookie, max_age=SESSION_MAX_AGE, httponly=True, samesite="Lax", secure=True)
         return resp
 
@@ -507,6 +527,37 @@ def build_dashboard_routes(
     async def api_patch_idcardbg(request: web.Request) -> web.Response:
         return await _handle_customization_patch(request, "idcardbg")
 
+    # ---------------- Premium checkout (order intake — no live payment yet) ----------------
+
+    _PRODUCTS = {"premium", "noprefix", "badge"}
+
+    async def api_get_payment_methods(request: web.Request) -> web.Response:
+        sess = _session_from_request(request)
+        if not sess:
+            return web.json_response({"error": "not_logged_in"}, status=401)
+        return web.json_response(get_payment_methods())
+
+    async def api_post_premium_order(request: web.Request) -> web.Response:
+        sess = _session_from_request(request)
+        if not sess:
+            return web.json_response({"error": "not_logged_in"}, status=401)
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+
+        product   = str(body.get("product", "")).strip().lower()
+        plan_id   = str(body.get("plan_id", "")).strip()
+        plan_label = str(body.get("plan_label", "")).strip()[:60]
+        price     = str(body.get("price", "")).strip()[:20]
+        if product not in _PRODUCTS or not plan_id or not plan_label or not price:
+            return web.json_response({"error": "Missing or invalid order details."}, status=400)
+
+        order_id = create_premium_order(int(sess["uid"]), sess["username"], product, plan_id, plan_label, price)
+        return web.json_response({"order_id": order_id})
+
     # ---------------- Frontend shell ----------------
 
     async def serve_dashboard_shell(request: web.Request) -> web.Response:
@@ -521,6 +572,8 @@ def build_dashboard_routes(
     app.router.add_patch("/api/me/rankbg", api_patch_rankbg)
     app.router.add_patch("/api/me/idcardcolor", api_patch_idcardcolor)
     app.router.add_patch("/api/me/idcardbg", api_patch_idcardbg)
+    app.router.add_get("/api/payment-methods", api_get_payment_methods)
+    app.router.add_post("/api/premium/order", api_post_premium_order)
     app.router.add_get("/api/guilds/{guild_id}/leveling", api_get_leveling)
     app.router.add_patch("/api/guilds/{guild_id}/leveling", api_patch_leveling)
     app.router.add_get("/api/guilds/{guild_id}/channels", api_guild_channels)
@@ -694,11 +747,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .add-stop-btn:hover{ color:var(--ink); border-color:var(--muted); }
   .add-stop-btn:disabled{ opacity:0.35; cursor:not-allowed; }
 
-  .gradient-bar{ height:44px; border-radius:8px; margin-bottom:18px; border:1px solid var(--line-2); box-shadow:inset 0 1px 3px rgba(0,0,0,0.4); }
+  .mini-id-card{
+    width:100%; max-width:420px; aspect-ratio:934/300; position:relative; border-radius:12px;
+    background:linear-gradient(160deg, #170d0e 0%, #2b0a0f 60%, #170d0e 100%);
+    border:1px solid rgba(245,166,35,0.24); overflow:hidden; margin-bottom:18px;
+    box-shadow:var(--shadow-sm); transition:background-image .3s ease;
+  }
+  .mini-id-card::before{
+    content:"VX"; position:absolute; right:-6%; top:-22%; font-family:'Big Shoulders',sans-serif; font-weight:900;
+    font-size:150px; color:rgba(255,255,255,0.035); line-height:1; pointer-events:none;
+  }
+  .mc-corner{ position:absolute; width:16px; height:16px; border:2px solid var(--gold); opacity:0.85; }
+  .mc-corner.tl{ top:8px; left:8px; border-right:none; border-bottom:none; }
+  .mc-corner.br{ bottom:8px; right:8px; border-left:none; border-top:none; }
+  .mc-body{ position:absolute; inset:0; display:flex; align-items:center; padding:7% 8%; gap:5%; }
+  .mc-avatar{
+    flex-shrink:0; width:24%; aspect-ratio:1;
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+    background: linear-gradient(145deg, var(--gold), var(--crimson)) border-box;
+    padding:3px; display:flex; align-items:center; justify-content:center;
+    box-shadow:0 0 24px -6px var(--gold-glow);
+  }
+  .mc-avatar img{ width:100%; height:100%; object-fit:cover; clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); background:var(--surface-2); }
+  .mc-info{ flex:1; min-width:0; }
+  .mc-name{ font-family:'Big Shoulders',sans-serif; font-weight:900; font-size:clamp(13px,3vw,21px); color:#fff; letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .mc-tag{ display:inline-flex; align-items:center; gap:6px; font-size:clamp(7px,1.3vw,10px); color:var(--gold); text-transform:uppercase; letter-spacing:0.1em; font-weight:600; margin:4px 0 8px; }
+  .mc-dot{ width:5px; height:5px; background:var(--gold); clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); flex-shrink:0; }
+  .mc-bar{ display:flex; gap:2px; }
+  .mc-bar i{ flex:1; height:7px; background:rgba(255,255,255,0.08); border-radius:1px; }
+  .mc-bar i.on{ background:linear-gradient(90deg, var(--crimson), var(--gold)); }
+  .mc-sub{ font-size:clamp(6px,1.1vw,9px); color:var(--muted); margin-top:7px; letter-spacing:0.04em; }
 
   .bg-preview{ width:100%; aspect-ratio: 934/300; border-radius:10px; border:1px solid var(--line); background:var(--surface-2) center/cover no-repeat; margin-bottom:14px; display:flex; align-items:center; justify-content:center; color:var(--muted-2); font-size:12.5px; overflow:hidden; }
 
   .custom-divider{ height:1px; background:var(--line); margin:34px 0 6px; }
+
+  /* ---------- Checkout ---------- */
+  .checkout-panel{ max-width:520px; }
+  .order-summary{ border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:24px; }
+  .order-row{ display:flex; align-items:center; justify-content:space-between; padding:12px 16px; font-size:13.5px; border-bottom:1px solid var(--line); background:var(--surface-2); }
+  .order-row:last-child{ border-bottom:none; }
+  .order-row span{ color:var(--muted); }
+  .order-row b{ display:flex; align-items:center; gap:8px; font-weight:600; }
+  .order-avatar{ width:22px; height:22px; border-radius:50%; }
+  .order-total{ background:rgba(245,166,35,0.07); }
+  .order-total b{ color:var(--gold); font-size:15px; }
+  .pay-loading{ color:var(--muted-2); font-size:12.5px; }
+  .pay-fallback{ font-size:13px; color:var(--muted); line-height:1.6; padding:14px 16px; border:1px dashed var(--line-2); border-radius:8px; }
+  .pay-method{ background:var(--surface-2); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:10px; }
+  .pay-method-name{ font-weight:600; font-size:13.5px; margin-bottom:6px; }
+  .pay-method-info{ font-size:12.5px; color:var(--muted); line-height:1.5; }
+  .pay-qris-img{ max-width:180px; border-radius:6px; display:block; margin-bottom:8px; }
+  .checkout-status{ font-size:12.5px; margin-top:10px; }
+  .checkout-status.err{ color:#e0637a; }
+  .order-done{ text-align:center; padding:20px 0; }
+  .order-done-icon{ width:52px; height:52px; border-radius:50%; background:rgba(245,166,35,0.14); color:var(--gold); font-size:24px; display:flex; align-items:center; justify-content:center; margin:0 auto 16px; }
+  .order-done p{ color:var(--muted); font-size:13.5px; line-height:1.6; margin-top:8px; }
 </style>
 </head>
 <body>
@@ -731,19 +835,129 @@ function renderNav(me) {
 
 function renderLogin() {
   app.innerHTML = '';
+  const next = encodeURIComponent(window.location.pathname + window.location.search);
   app.appendChild(el(`
     <div class="login-card">
       <div class="hex" style="margin:0 auto;"><span>V</span></div>
       <h1>Sign in to manage<br>your server</h1>
       <p>Log in with Discord to configure VALLENT EXS on any server where you have Manage Server permission.</p>
-      <a href="/auth/discord/login" class="btn btn-primary" style="width:100%;justify-content:center;">Continue with Discord</a>
+      <a href="/auth/discord/login?next=${next}" class="btn btn-primary" style="width:100%;justify-content:center;">Continue with Discord</a>
     </div>
   `));
 }
 
+const PRODUCT_LABELS = { premium: 'Premium', noprefix: 'No-Prefix Only', badge: 'Custom Profile Badge' };
+
+async function renderCheckout(me) {
+  app.innerHTML = '';
+  const q = new URLSearchParams(window.location.search);
+  const product = (q.get('product') || '').toLowerCase();
+  const planId = q.get('plan') || '';
+  const planLabel = q.get('label') || '';
+  const price = q.get('price') || '';
+
+  if (!PRODUCT_LABELS[product] || !planId || !planLabel || !price) {
+    app.appendChild(el(`
+      <a class="back-link" href="https://vallentexs.web.id/pricing.html">&larr; Back to Pricing</a>
+      <div class="panel"><h2>Order not found</h2><p style="color:var(--muted);margin-top:8px;">This checkout link is missing some details. Head back to the pricing page and pick a plan again.</p></div>
+    `));
+    return;
+  }
+
+  app.appendChild(el(`<a class="back-link" href="https://vallentexs.web.id/pricing.html">&larr; Back to Pricing</a>`));
+  app.appendChild(el(`<h1 class="page-title">Checkout</h1><p class="page-sub">Confirm your order below. Payment is verified manually right now — you'll be notified in Discord once Premium is activated.</p>`));
+
+  const card = el(`<div class="panel checkout-panel"></div>`);
+  card.appendChild(el(`
+    <div class="order-summary">
+      <div class="order-row"><span>Product</span><b>${PRODUCT_LABELS[product]}</b></div>
+      <div class="order-row"><span>Plan</span><b>${planLabel}</b></div>
+      <div class="order-row"><span>Buying as</span><b>${me.avatar ? `<img class="order-avatar" src="${me.avatar}">` : ''}${me.username}</b></div>
+      <div class="order-row order-total"><span>Total</span><b>$${price}</b></div>
+    </div>
+  `));
+
+  const payBox = el(`<div class="pay-methods"><div class="pay-loading">Loading payment options...</div></div>`);
+  card.appendChild(payBox);
+
+  const statusEl = el(`<div class="checkout-status"></div>`);
+  const submitBtn = el(`<button class="btn btn-primary btn-block">I've Paid — Submit Order</button>`);
+  const submitWrap = el(`<div style="margin-top:22px;"></div>`);
+  submitWrap.appendChild(submitBtn);
+  submitWrap.appendChild(statusEl);
+  card.appendChild(submitWrap);
+
+  submitBtn.onclick = async () => {
+    submitBtn.disabled = true;
+    statusEl.textContent = 'Submitting...';
+    statusEl.className = 'checkout-status';
+    const res = await api('/api/premium/order', {
+      method: 'POST',
+      body: JSON.stringify({ product, plan_id: planId, plan_label: planLabel, price }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      card.innerHTML = '';
+      card.appendChild(el(`
+        <div class="order-done">
+          <div class="order-done-icon">✓</div>
+          <h2>Order submitted</h2>
+          <p>Order <span class="mono">#${data.order_id}</span> for <b>${PRODUCT_LABELS[product]} — ${planLabel}</b> is in. We'll verify your payment and activate it on your account, then follow up in your Discord DMs.</p>
+          <a href="https://discord.gg/ahHan43mqe" class="btn btn-ghost" style="margin-top:16px;">Join Support Server</a>
+        </div>
+      `));
+    } else {
+      statusEl.textContent = data.error || 'Something went wrong — please try again or reach out on the support server.';
+      statusEl.className = 'checkout-status err';
+      submitBtn.disabled = false;
+    }
+  };
+
+  app.appendChild(card);
+
+  const pmRes = await api('/api/payment-methods');
+  payBox.innerHTML = '';
+  if (!pmRes.ok) {
+    payBox.appendChild(el(`<p style="color:var(--muted);font-size:13px;">Couldn't load payment options — you can still submit your order and we'll follow up in Discord.</p>`));
+    return;
+  }
+  const pm = await pmRes.json();
+  const active = Object.entries(pm).filter(([, v]) => v && v.enabled);
+  if (active.length === 0) {
+    payBox.appendChild(el(`<div class="pay-fallback">Payment options aren't set up on the site yet — submit your order below and reach out on the <a href="https://discord.gg/ahHan43mqe" style="color:var(--gold);">support server</a> to arrange payment directly.</div>`));
+    return;
+  }
+  payBox.appendChild(el(`<div class="custom-subhead" style="margin-top:0;">Pay with</div>`));
+  active.forEach(([key, v]) => {
+    if (key === 'qris') {
+      payBox.appendChild(el(`
+        <div class="pay-method">
+          <div class="pay-method-name">QRIS</div>
+          ${v.image_url ? `<img class="pay-qris-img" src="${v.image_url}">` : ''}
+          ${v.info ? `<p class="pay-method-info">${v.info}</p>` : ''}
+        </div>
+      `));
+    } else if (key === 'bank') {
+      payBox.appendChild(el(`
+        <div class="pay-method">
+          <div class="pay-method-name">Bank Transfer</div>
+          <p class="pay-method-info">${v.bank_name || ''} &middot; <span class="mono">${v.account_number || ''}</span> &middot; a.n. ${v.account_name || ''}</p>
+        </div>
+      `));
+    } else if (key === 'ewallet') {
+      payBox.appendChild(el(`
+        <div class="pay-method">
+          <div class="pay-method-name">${v.type || 'E-Wallet'}</div>
+          <p class="pay-method-info"><span class="mono">${v.number || ''}</span></p>
+        </div>
+      `));
+    }
+  });
+}
+
 async function renderGuildPicker(me) {
   app.innerHTML = '';
-  app.appendChild(await buildCustomizationCard());
+  app.appendChild(await buildCustomizationCard(me));
   app.appendChild(el(`<h1 class="page-title">Your Servers</h1><p class="page-sub">Pick a server to configure. Only servers where VALLENT EXS is present and you have Manage Server show as available.</p>`));
   const grid = el('<div class="guild-grid"></div>');
   me.guilds.forEach(g => {
@@ -769,19 +983,48 @@ function defaultStops(existing) {
   return ['A672FF', '20DCD2'];
 }
 
-function buildGradientEditor(guildIdLike, label, subnote, existingColors, existingBg, saveColorPath, saveBgPath, isPremium) {
+function buildGradientEditor(me, label, subnote, existingColors, existingBg, saveColorPath, saveBgPath, isPremium) {
   const wrap = el(`<div></div>`);
   wrap.appendChild(el(`<div class="custom-subhead">${label}</div><div class="custom-subnote">${subnote}</div>`));
 
   // ---- gradient ----
   let stops = defaultStops(existingColors);
   const stopsBox = el(`<div class="color-stops"></div>`);
-  const bar = el(`<div class="gradient-bar"></div>`);
   const addBtn = el(`<button type="button" class="add-stop-btn">+ Add a 3rd color</button>`);
 
+  // ---- live mini card preview, synced to the real logged-in user ----
+  const avatarHtml = me.avatar ? `<img src="${me.avatar}">` : '';
+  const miniCard = el(`
+    <div class="mini-id-card">
+      <div class="mc-corner tl"></div>
+      <div class="mc-corner br"></div>
+      <div class="mc-body">
+        <div class="mc-avatar">${avatarHtml}</div>
+        <div class="mc-info">
+          <div class="mc-name">${(me.username || 'YOU').toUpperCase()}</div>
+          <div class="mc-tag"><span class="mc-dot"></span>${isPremium ? 'Premium Member' : 'Preview'}</div>
+          <div class="mc-bar">${Array.from({length: 15}, (_, i) => `<i class="${i < 8 ? 'on' : ''}"></i>`).join('')}</div>
+          <div class="mc-sub">LIVE PREVIEW &middot; ${label.toUpperCase()}</div>
+        </div>
+      </div>
+    </div>
+  `);
+  function updateMiniGradient() {
+    const grad = `linear-gradient(90deg, ${stops.map(s => '#' + s).join(', ')})`;
+    miniCard.querySelectorAll('.mc-bar i.on').forEach(i => { i.style.background = grad; });
+    miniCard.querySelector('.mc-avatar').style.background = `linear-gradient(145deg, ${stops.map(s => '#' + s).join(', ')}) border-box`;
+    miniCard.querySelector('.mc-dot').style.background = '#' + stops[stops.length - 1];
+  }
+  function updateMiniBackground(url) {
+    miniCard.style.backgroundImage = url ? `linear-gradient(160deg, rgba(10,6,5,0.55), rgba(10,6,5,0.75)), url('${url}')` : '';
+    miniCard.style.backgroundSize = 'cover';
+    miniCard.style.backgroundPosition = 'center';
+  }
+  if (existingBg) updateMiniBackground(existingBg);
+
   function updateBar() {
-    bar.style.background = `linear-gradient(90deg, ${stops.map(s => '#' + s).join(', ')})`;
     addBtn.disabled = stops.length >= 3 || !isPremium;
+    updateMiniGradient();
   }
 
   function renderStops() {
@@ -823,11 +1066,14 @@ function buildGradientEditor(guildIdLike, label, subnote, existingColors, existi
   removeGradBtn.onclick = async () => {
     gradStatus.textContent = 'Removing...'; gradStatus.className = 'save-status';
     const res = await api(saveColorPath, { method: 'PATCH', body: JSON.stringify({ colors: null }) });
-    if (res.ok) { gradStatus.textContent = 'Removed — back to default gold.'; gradStatus.className = 'save-status ok'; }
+    if (res.ok) {
+      gradStatus.textContent = 'Removed — back to default gold.'; gradStatus.className = 'save-status ok';
+      stops = defaultStops(null); renderStops(); updateBar();
+    }
     else { const data = await res.json(); gradStatus.textContent = data.error || 'Failed to remove.'; gradStatus.className = 'save-status err'; }
   };
 
-  wrap.appendChild(bar);
+  wrap.appendChild(miniCard);
   wrap.appendChild(stopsBox);
   wrap.appendChild(addBtn);
   wrap.appendChild(el(`<div class="save-row">${''}</div>`));
@@ -836,8 +1082,6 @@ function buildGradientEditor(guildIdLike, label, subnote, existingColors, existi
 
   // ---- background ----
   wrap.appendChild(el(`<div class="custom-subhead" style="margin-top:26px;font-size:13.5px;">Custom Background</div>`));
-  const bgPreview = el(`<div class="bg-preview">${existingBg ? '' : 'No custom background set'}</div>`);
-  if (existingBg) bgPreview.style.backgroundImage = `url('${existingBg}')`;
   const bgInput = el(`<input type="url" placeholder="https://example.com/background.png" value="${existingBg || ''}" ${isPremium ? '' : 'disabled'}>`);
   const bgStatus = el(`<span class="save-status"></span>`);
   const saveBgBtn = el(`<button class="btn btn-primary btn-sm" ${isPremium ? '' : 'disabled'}>Save Background</button>`);
@@ -848,17 +1092,15 @@ function buildGradientEditor(guildIdLike, label, subnote, existingColors, existi
     const data = await res.json();
     if (res.ok) {
       bgStatus.textContent = 'Saved.'; bgStatus.className = 'save-status ok';
-      bgPreview.style.backgroundImage = bgInput.value.trim() ? `url('${bgInput.value.trim()}')` : '';
-      bgPreview.textContent = bgInput.value.trim() ? '' : 'No custom background set';
+      updateMiniBackground(bgInput.value.trim());
     } else { bgStatus.textContent = data.error || 'Failed to save.'; bgStatus.className = 'save-status err'; }
   };
   removeBgBtn.onclick = async () => {
     bgStatus.textContent = 'Removing...'; bgStatus.className = 'save-status';
     const res = await api(saveBgPath, { method: 'PATCH', body: JSON.stringify({ url: null }) });
-    if (res.ok) { bgStatus.textContent = 'Removed.'; bgStatus.className = 'save-status ok'; bgInput.value = ''; bgPreview.style.backgroundImage = ''; bgPreview.textContent = 'No custom background set'; }
+    if (res.ok) { bgStatus.textContent = 'Removed.'; bgStatus.className = 'save-status ok'; bgInput.value = ''; updateMiniBackground(''); }
     else { const data = await res.json(); bgStatus.textContent = data.error || 'Failed to remove.'; bgStatus.className = 'save-status err'; }
   };
-  wrap.appendChild(bgPreview);
   wrap.appendChild(el(`<div class="field" style="margin-bottom:10px;"></div>`)).appendChild(bgInput);
   wrap.appendChild(el(`<div class="save-row">${''}</div>`));
   const bgRow = wrap.lastChild;
@@ -867,7 +1109,7 @@ function buildGradientEditor(guildIdLike, label, subnote, existingColors, existi
   return wrap;
 }
 
-async function buildCustomizationCard() {
+async function buildCustomizationCard(me) {
   const res = await api('/api/me/customization');
   if (!res.ok) return el('<div></div>');
   const c = await res.json();
@@ -876,13 +1118,13 @@ async function buildCustomizationCard() {
   card.appendChild(el(`<div class="panel-head"><h2>My Rank Card &amp; Profile</h2></div>`));
   card.appendChild(el(
     c.is_premium
-      ? `<div class="premium-banner"><div class="pb-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="1.8"><path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2L12 16.4 5.7 21l2.3-7.2-6-4.6h7.6z"/></svg></div><div class="pb-text"><b>Premium active</b> — customize the gradient and background on your rank card, level-up card, and profile ID card below.</div></div>`
-      : `<div class="premium-banner is-off"><div class="pb-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#a3908d" stroke-width="1.8"><path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2L12 16.4 5.7 21l2.3-7.2-6-4.6h7.6z"/></svg></div><div class="pb-text">Custom gradients and backgrounds are a <b>Premium</b> perk. Ask the bot owner about getting Premium to unlock these.</div></div>`
+      ? `<div class="premium-banner"><div class="pb-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="1.8"><path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2L12 16.4 5.7 21l2.3-7.2-6-4.6h7.6z"/></svg></div><div class="pb-text"><b>Premium active</b> — customize the gradient and background on your rank card, level-up card, and profile ID card below. The preview updates live and reflects your own Discord name &amp; avatar.</div></div>`
+      : `<div class="premium-banner is-off"><div class="pb-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#a3908d" stroke-width="1.8"><path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2L12 16.4 5.7 21l2.3-7.2-6-4.6h7.6z"/></svg></div><div class="pb-text">Custom gradients and backgrounds are a <b>Premium</b> perk. <a href="https://vallentexs.web.id/pricing.html" style="color:var(--gold);">Get Premium</a> to unlock these.</div></div>`
   ));
 
-  card.appendChild(buildGradientEditor(null, 'Rank Card & Level-Up Card', 'Applies to your `rank` card and level-up announcement card.', c.rank_colors, c.rank_background, '/api/me/rankcolor', '/api/me/rankbg', c.is_premium));
+  card.appendChild(buildGradientEditor(me, 'Rank Card & Level-Up Card', 'Applies to your `rank` card and level-up announcement card.', c.rank_colors, c.rank_background, '/api/me/rankcolor', '/api/me/rankbg', c.is_premium));
   card.appendChild(el(`<div class="custom-divider"></div>`));
-  card.appendChild(buildGradientEditor(null, 'Profile ID Card', 'Applies to your `profile` ID card only — kept separate so it can look different from your rank card.', c.profile_colors, c.profile_background, '/api/me/idcardcolor', '/api/me/idcardbg', c.is_premium));
+  card.appendChild(buildGradientEditor(me, 'Profile ID Card', 'Applies to your `profile` ID card only — kept separate so it can look different from your rank card.', c.profile_colors, c.profile_background, '/api/me/idcardcolor', '/api/me/idcardbg', c.is_premium));
 
   return card;
 }
@@ -1233,7 +1475,9 @@ async function boot() {
   if (!me.logged_in) { renderLogin(); return; }
 
   const parts = window.location.pathname.split('/').filter(Boolean);
-  if (parts.length === 2 && parts[0] === 'dashboard') {
+  if (parts.length === 2 && parts[0] === 'dashboard' && parts[1] === 'checkout') {
+    renderCheckout(me);
+  } else if (parts.length === 2 && parts[0] === 'dashboard') {
     renderGuildEditor(parts[1]);
   } else {
     renderGuildPicker(me);
