@@ -981,20 +981,82 @@ async def start_vote_webhook_server():
             def _get_leveling(guild_id: int) -> dict:
                 gc = guild_cfg(cfg, guild_id)
                 ch = gc.get("level_channel")
+                guild = bot.get_guild(guild_id)
+                xp_min, xp_max = gc.get("xp_per_message", [15, 25])
+                noxp_roles = []
+                for rid in gc.get("xp_ignore_roles", []):
+                    role = guild.get_role(rid) if guild else None
+                    noxp_roles.append({"id": str(rid), "name": role.name if role else f"Unknown role ({rid})"})
+                level_roles = []
+                for lvl_str, rid in gc.get("level_roles", {}).items():
+                    role = guild.get_role(rid) if guild else None
+                    level_roles.append({"level": int(lvl_str), "role_id": str(rid), "role_name": role.name if role else f"Unknown role ({rid})"})
+                level_roles.sort(key=lambda r: r["level"])
                 return {
                     "enabled": gc.get("leveling_enabled", True),
                     "channel_id": str(ch) if ch else None,
                     "difficulty": gc.get("xp_difficulty", 1.0),
+                    "xp_min": xp_min,
+                    "xp_max": xp_max,
+                    "cooldown": gc.get("xp_cooldown", 60),
+                    "message": gc.get("levelup_message", "{mention} just leveled up to **Level {level}**! Keep chatting in {server} to climb even higher. {roles}"),
+                    "noxp_roles": noxp_roles,
+                    "level_roles": level_roles,
                 }
 
-            def _set_leveling(guild_id: int, update: dict) -> None:
+            def _set_leveling(guild_id: int, update: dict) -> Optional[str]:
                 gc = guild_cfg(cfg, guild_id)
                 if "enabled" in update:
-                    gc["leveling_enabled"] = update["enabled"]
+                    gc["leveling_enabled"] = bool(update["enabled"])
                 if "channel_id" in update:
                     gc["level_channel"] = int(update["channel_id"]) if update["channel_id"] else None
                 if "difficulty" in update:
                     gc["xp_difficulty"] = update["difficulty"]
+                if "xp_min" in update or "xp_max" in update:
+                    cur_min, cur_max = gc.get("xp_per_message", [15, 25])
+                    xp_min = int(update.get("xp_min", cur_min))
+                    xp_max = int(update.get("xp_max", cur_max))
+                    if xp_min < 1 or xp_max > 1000 or xp_max < xp_min:
+                        return "XP per message must be between 1 and 1000, with max not less than min."
+                    gc["xp_per_message"] = [xp_min, xp_max]
+                if "cooldown" in update:
+                    cd = int(update["cooldown"])
+                    if not (0 <= cd <= 3600):
+                        return "Cooldown must be between 0 and 3600 seconds."
+                    gc["xp_cooldown"] = cd
+                if "message" in update:
+                    msg = (update["message"] or "").strip()
+                    gc["levelup_message"] = msg or "{mention} just leveled up to **Level {level}**! Keep chatting in {server} to climb even higher. {roles}"
+                save_config(cfg)
+                return None
+
+            def _add_leveling_noxp_role(guild_id: int, role_id: int) -> Optional[str]:
+                gc = guild_cfg(cfg, guild_id)
+                ignore_roles = gc.setdefault("xp_ignore_roles", [])
+                if role_id not in ignore_roles:
+                    ignore_roles.append(role_id)
+                    save_config(cfg)
+                return None
+
+            def _remove_leveling_noxp_role(guild_id: int, role_id: int) -> None:
+                gc = guild_cfg(cfg, guild_id)
+                ignore_roles = gc.get("xp_ignore_roles", [])
+                if role_id in ignore_roles:
+                    ignore_roles.remove(role_id)
+                    save_config(cfg)
+
+            def _set_leveling_role_reward(guild_id: int, level: int, role_id: int) -> Optional[str]:
+                if level < 1:
+                    return "Level must be 1 or higher."
+                gc = guild_cfg(cfg, guild_id)
+                level_roles = gc.setdefault("level_roles", {})
+                level_roles[str(level)] = role_id
+                save_config(cfg)
+                return None
+
+            def _remove_leveling_role_reward(guild_id: int, level: int) -> None:
+                gc = guild_cfg(cfg, guild_id)
+                gc.get("level_roles", {}).pop(str(level), None)
                 save_config(cfg)
 
             def _get_antinuke(guild_id: int) -> dict:
@@ -1260,6 +1322,10 @@ async def start_vote_webhook_server():
                 get_bot=lambda: bot,
                 get_leveling=_get_leveling,
                 set_leveling=_set_leveling,
+                add_leveling_noxp_role=_add_leveling_noxp_role,
+                remove_leveling_noxp_role=_remove_leveling_noxp_role,
+                set_leveling_role_reward=_set_leveling_role_reward,
+                remove_leveling_role_reward=_remove_leveling_role_reward,
                 get_antinuke=_get_antinuke,
                 set_antinuke=_set_antinuke,
                 add_antinuke_whitelist=_add_antinuke_whitelist,
