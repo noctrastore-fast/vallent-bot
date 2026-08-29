@@ -95,7 +95,11 @@ def build_dashboard_routes(
     session_secret: str,
     get_bot: Callable[[], object],
     get_leveling: Callable[[int], dict],
-    set_leveling: Callable[[int, dict], None],
+    set_leveling: Callable[[int, dict], Optional[str]],
+    add_leveling_noxp_role: Callable[[int, int], Optional[str]],
+    remove_leveling_noxp_role: Callable[[int, int], None],
+    set_leveling_role_reward: Callable[[int, int, int], Optional[str]],
+    remove_leveling_role_reward: Callable[[int, int], None],
     get_antinuke: Callable[[int], dict],
     set_antinuke: Callable[[int, dict], Optional[str]],
     add_antinuke_whitelist: Callable[[int, int], Optional[str]],
@@ -116,8 +120,12 @@ def build_dashboard_routes(
     aiohttp `app` (the same one the top.gg webhook runs on). Everything
     this module needs from the bot/config side comes in as a callable:
       - get_bot()                    -> the discord.py Bot instance
-      - get_leveling(guild_id)       -> {"enabled": bool, "channel_id": str|None, "difficulty": float}
-      - set_leveling(guild_id, dict) -> applies + persists a partial update
+      - get_leveling(guild_id)       -> {"enabled", "channel_id", "difficulty", "xp_min", "xp_max",
+        "cooldown", "message", "noxp_roles": [{"id","name"}], "level_roles": [{"level","role_id","role_name"}]}
+      - set_leveling(guild_id, dict) -> applies + persists a partial update; returns an error string or None
+      - add/remove_leveling_noxp_role(guild_id, role_id) -> mutate the no-XP role list by one role
+      - set_leveling_role_reward(guild_id, level, role_id) -> upsert one level's role reward; returns an error string or None
+      - remove_leveling_role_reward(guild_id, level) -> remove one level's role reward
       - get_antinuke(guild_id)       -> {"enabled", "log_channel", "punishment", "whitelist": [...], "bot_has_audit_log_perm"}
       - set_antinuke(guild_id, dict) -> applies + persists a partial update; returns an error string or None
       - add/remove_antinuke_whitelist(guild_id, user_id) -> mutate the whitelist by one user
@@ -300,7 +308,98 @@ def build_dashboard_routes(
             if not (0.1 <= d <= 10):
                 return web.json_response({"error": "difficulty_out_of_range"}, status=400)
             update["difficulty"] = d
-        set_leveling(int(guild_id), update)
+        if "xp_min" in body or "xp_max" in body:
+            try:
+                if "xp_min" in body:
+                    update["xp_min"] = int(body["xp_min"])
+                if "xp_max" in body:
+                    update["xp_max"] = int(body["xp_max"])
+            except (TypeError, ValueError):
+                return web.json_response({"error": "invalid_xp_range"}, status=400)
+        if "cooldown" in body:
+            try:
+                update["cooldown"] = int(body["cooldown"])
+            except (TypeError, ValueError):
+                return web.json_response({"error": "invalid_cooldown"}, status=400)
+        if "message" in body:
+            update["message"] = str(body["message"])[:800]
+        error = set_leveling(int(guild_id), update)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_leveling(int(guild_id)))
+
+    async def api_guild_roles(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        bot = get_bot()
+        guild = bot.get_guild(int(guild_id))
+        roles = [{"id": str(r.id), "name": r.name} for r in guild.roles if not r.is_default()]
+        roles.sort(key=lambda r: r["name"].lower())
+        return web.json_response(roles)
+
+    async def api_add_leveling_noxp(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+            role_id = int(body["id"])
+        except Exception:
+            return web.json_response({"error": "invalid_id"}, status=400)
+        error = add_leveling_noxp_role(int(guild_id), role_id)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_leveling(int(guild_id)))
+
+    async def api_remove_leveling_noxp(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        role_id = request.match_info["role_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            remove_leveling_noxp_role(int(guild_id), int(role_id))
+        except Exception:
+            return web.json_response({"error": "invalid_id"}, status=400)
+        return web.json_response(get_leveling(int(guild_id)))
+
+    async def api_set_leveling_role_reward(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+            level = int(body["level"])
+            role_id = int(body["role_id"])
+        except Exception:
+            return web.json_response({"error": "invalid_id"}, status=400)
+        error = set_leveling_role_reward(int(guild_id), level, role_id)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_leveling(int(guild_id)))
+
+    async def api_remove_leveling_role_reward(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        level = request.match_info["level"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            remove_leveling_role_reward(int(guild_id), int(level))
+        except Exception:
+            return web.json_response({"error": "invalid_level"}, status=400)
         return web.json_response(get_leveling(int(guild_id)))
 
     async def api_guild_channels(request: web.Request) -> web.Response:
@@ -576,7 +675,12 @@ def build_dashboard_routes(
     app.router.add_post("/api/premium/order", api_post_premium_order)
     app.router.add_get("/api/guilds/{guild_id}/leveling", api_get_leveling)
     app.router.add_patch("/api/guilds/{guild_id}/leveling", api_patch_leveling)
+    app.router.add_post("/api/guilds/{guild_id}/leveling/noxp", api_add_leveling_noxp)
+    app.router.add_delete("/api/guilds/{guild_id}/leveling/noxp/{role_id}", api_remove_leveling_noxp)
+    app.router.add_post("/api/guilds/{guild_id}/leveling/role-reward", api_set_leveling_role_reward)
+    app.router.add_delete("/api/guilds/{guild_id}/leveling/role-reward/{level}", api_remove_leveling_role_reward)
     app.router.add_get("/api/guilds/{guild_id}/channels", api_guild_channels)
+    app.router.add_get("/api/guilds/{guild_id}/roles", api_guild_roles)
     app.router.add_get("/api/guilds/{guild_id}/antinuke", api_get_antinuke)
     app.router.add_patch("/api/guilds/{guild_id}/antinuke", api_patch_antinuke)
     app.router.add_post("/api/guilds/{guild_id}/antinuke/whitelist", api_add_antinuke_whitelist)
@@ -692,11 +796,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .panel-head h2{ font-family:'Outfit',sans-serif; text-transform:none; font-weight:700; font-size:17px; letter-spacing:0; }
   .field{ margin-bottom:20px; }
   .field label{ display:block; font-size:12.5px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin-bottom:8px; }
-  .field select, .field input[type=number]{
+  .field select, .field input[type=number], .field textarea{
     width:100%; background:var(--surface-2); border:1px solid var(--line); border-radius:6px; padding:10px 12px;
     color:var(--ink); font-family:'Outfit',sans-serif; font-size:14px; outline:none;
   }
-  .field select:focus, .field input:focus{ border-color:var(--crimson); }
+  .field textarea{ resize:vertical; min-height:64px; line-height:1.5; }
+  .field select:focus, .field input:focus, .field textarea:focus{ border-color:var(--crimson); }
+  .field-row{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:520px){ .field-row{ grid-template-columns:1fr; } }
   .toggle{ position:relative; display:inline-block; width:46px; height:26px; }
   .toggle input{ opacity:0; width:0; height:0; }
   .toggle-slider{ position:absolute; inset:0; background:var(--surface-2); border:1px solid var(--line); border-radius:14px; cursor:pointer; transition:.2s; }
@@ -1158,9 +1265,10 @@ function setBadge(card, enabled) {
 
 async function renderGuildEditor(guildId) {
   app.innerHTML = '<div class="loading">Loading server settings…</div>';
-  const [lvlRes, chRes, anRes, asRes] = await Promise.all([
+  const [lvlRes, chRes, rolesRes, anRes, asRes] = await Promise.all([
     api(`/api/guilds/${guildId}/leveling`),
     api(`/api/guilds/${guildId}/channels`),
+    api(`/api/guilds/${guildId}/roles`),
     api(`/api/guilds/${guildId}/antinuke`),
     api(`/api/guilds/${guildId}/antispam`),
   ]);
@@ -1170,6 +1278,7 @@ async function renderGuildEditor(guildId) {
   }
   const lvl = await lvlRes.json();
   const channels = await chRes.json();
+  const roles = await rolesRes.json();
   const an = await anRes.json();
   const as_ = await asRes.json();
 
@@ -1178,6 +1287,8 @@ async function renderGuildEditor(guildId) {
   app.appendChild(el(`<h1 class="page-title">Server Settings</h1><p class="page-sub">Click a system below to open its settings. More systems (Moderation, Tickets, Verification...) are on the way.</p>`));
 
   // ---------------- Level & XP ----------------
+  const roleOptions = (selectedId) => roles.map(r => `<option value="${r.id}" ${selectedId === r.id ? 'selected' : ''}>@${r.name}</option>`).join('');
+
   const lvlCard = makeSysCard('<svg viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="1.6"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>', 'Level &amp; XP', 'XP gain, level-up announcements, difficulty', lvl.enabled, `
     <div class="field">
       <label>Enabled</label>
@@ -1186,33 +1297,137 @@ async function renderGuildEditor(guildId) {
     <div class="field">
       <label>Level-Up Announcement Channel</label>
       <select id="lvlChannel">
-        <option value="">— None (no announcement) —</option>
+        <option value="">— None (announce in the channel it happened) —</option>
         ${channels.map(c => `<option value="${c.id}" ${lvl.channel_id === c.id ? 'selected' : ''}>#${c.name}</option>`).join('')}
       </select>
     </div>
+    <div class="field-row">
+      <div class="field"><label>Min XP per Message</label><input type="number" id="lvlXpMin" min="1" max="1000" value="${lvl.xp_min}"></div>
+      <div class="field"><label>Max XP per Message</label><input type="number" id="lvlXpMax" min="1" max="1000" value="${lvl.xp_max}"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>XP Cooldown (seconds, 0–3600)</label><input type="number" id="lvlCooldown" min="0" max="3600" value="${lvl.cooldown}"></div>
+      <div class="field"><label>Difficulty Multiplier (0.1 – 10)</label><input type="number" id="lvlDifficulty" min="0.1" max="10" step="0.1" value="${lvl.difficulty}"></div>
+    </div>
     <div class="field">
-      <label>XP Difficulty Multiplier (0.1 – 10)</label>
-      <input type="number" id="lvlDifficulty" min="0.1" max="10" step="0.1" value="${lvl.difficulty}">
+      <label>Level-Up Message</label>
+      <textarea id="lvlMessage" rows="3">${lvl.message}</textarea>
+      <div class="soon-note">Placeholders: <span class="mono">{mention}</span> <span class="mono">{user}</span> <span class="mono">{level}</span> <span class="mono">{server}</span> <span class="mono">{roles}</span> — <span class="mono">{roles}</span> is blank when no role reward was earned.</div>
     </div>
     <div class="save-row">
       <button class="btn btn-primary" id="saveLvl">Save Changes</button>
       <span class="save-status" id="lvlStatus"></span>
     </div>
+
+    <div class="field" style="margin-top:28px;">
+      <label>No-XP Roles (members with these never gain XP or level up)</label>
+      <div id="noxpList" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;"></div>
+      <div style="display:flex;gap:8px;">
+        <select id="noxpRole" style="flex:1;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'Outfit',sans-serif;font-size:14px;">${roles.length ? roleOptions() : '<option value="">No roles found</option>'}</select>
+        <button class="btn btn-ghost" id="noxpAdd">Add</button>
+      </div>
+      <span class="save-status" id="noxpStatus"></span>
+    </div>
+
+    <div class="field" style="margin-top:28px;">
+      <label>Level Role Rewards (auto-grant a role at a level)</label>
+      <div id="lvlRoleList" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;"></div>
+      <div style="display:flex;gap:8px;">
+        <input type="number" id="lvlRewardLevel" placeholder="Level" min="1" style="width:90px;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'Outfit',sans-serif;font-size:14px;">
+        <select id="lvlRewardRole" style="flex:1;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'Outfit',sans-serif;font-size:14px;">${roles.length ? roleOptions() : '<option value="">No roles found</option>'}</select>
+        <button class="btn btn-ghost" id="lvlRewardAdd">Add</button>
+      </div>
+      <span class="save-status" id="lvlRewardStatus"></span>
+    </div>
   `);
   app.appendChild(lvlCard);
 
-  document.getElementById('saveLvl').onclick = async (e) => {
+  function renderNoxpList(list) {
+    const box = lvlCard.querySelector('#noxpList');
+    box.innerHTML = '';
+    if (!list.length) { box.appendChild(el(`<div class="soon-note">No no-XP roles set — everyone gains XP normally.</div>`)); return; }
+    list.forEach(r => {
+      const row = el(`
+        <div style="display:flex;align-items:center;gap:10px;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;">
+          <span style="flex:1;font-size:13.5px;">@${r.name}</span>
+          <button data-rid="${r.id}" style="background:transparent;border:none;color:var(--muted-2);cursor:pointer;font-size:16px;">&times;</button>
+        </div>
+      `);
+      row.querySelector('button').onclick = async (e) => {
+        e.stopPropagation();
+        const rid = e.target.getAttribute('data-rid');
+        const res = await api(`/api/guilds/${guildId}/leveling/noxp/${rid}`, { method: 'DELETE' });
+        if (res.ok) { const data = await res.json(); renderNoxpList(data.noxp_roles); }
+      };
+      box.appendChild(row);
+    });
+  }
+  renderNoxpList(lvl.noxp_roles);
+
+  lvlCard.querySelector('#noxpAdd').onclick = async (e) => {
+    e.stopPropagation();
+    const select = lvlCard.querySelector('#noxpRole');
+    const status = lvlCard.querySelector('#noxpStatus');
+    if (!select.value) return;
+    status.textContent = 'Adding...'; status.className = 'save-status';
+    const res = await api(`/api/guilds/${guildId}/leveling/noxp`, { method: 'POST', body: JSON.stringify({ id: select.value }) });
+    const data = await res.json();
+    if (res.ok) { status.textContent = ''; renderNoxpList(data.noxp_roles); }
+    else { status.textContent = data.error || 'Failed to add.'; status.className = 'save-status err'; }
+  };
+
+  function renderLvlRoleList(list) {
+    const box = lvlCard.querySelector('#lvlRoleList');
+    box.innerHTML = '';
+    if (!list.length) { box.appendChild(el(`<div class="soon-note">No role rewards set yet.</div>`)); return; }
+    list.forEach(r => {
+      const row = el(`
+        <div style="display:flex;align-items:center;gap:10px;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;">
+          <span style="flex:1;font-size:13.5px;">Level <b>${r.level}</b> &rarr; @${r.role_name}</span>
+          <button data-lvl="${r.level}" style="background:transparent;border:none;color:var(--muted-2);cursor:pointer;font-size:16px;">&times;</button>
+        </div>
+      `);
+      row.querySelector('button').onclick = async (e) => {
+        e.stopPropagation();
+        const level = e.target.getAttribute('data-lvl');
+        const res = await api(`/api/guilds/${guildId}/leveling/role-reward/${level}`, { method: 'DELETE' });
+        if (res.ok) { const data = await res.json(); renderLvlRoleList(data.level_roles); }
+      };
+      box.appendChild(row);
+    });
+  }
+  renderLvlRoleList(lvl.level_roles);
+
+  lvlCard.querySelector('#lvlRewardAdd').onclick = async (e) => {
+    e.stopPropagation();
+    const levelInput = lvlCard.querySelector('#lvlRewardLevel');
+    const roleSelect = lvlCard.querySelector('#lvlRewardRole');
+    const status = lvlCard.querySelector('#lvlRewardStatus');
+    const level = parseInt(levelInput.value, 10);
+    if (!level || level < 1 || !roleSelect.value) { status.textContent = 'Pick a level and a role.'; status.className = 'save-status err'; return; }
+    status.textContent = 'Adding...'; status.className = 'save-status';
+    const res = await api(`/api/guilds/${guildId}/leveling/role-reward`, { method: 'POST', body: JSON.stringify({ level, role_id: roleSelect.value }) });
+    const data = await res.json();
+    if (res.ok) { status.textContent = ''; levelInput.value = ''; renderLvlRoleList(data.level_roles); }
+    else { status.textContent = data.error || 'Failed to add.'; status.className = 'save-status err'; }
+  };
+
+  lvlCard.querySelector('#saveLvl').onclick = async (e) => {
     e.stopPropagation();
     const status = document.getElementById('lvlStatus');
     status.textContent = 'Saving...'; status.className = 'save-status';
     const body = {
       enabled: document.getElementById('lvlEnabled').checked,
       channel_id: document.getElementById('lvlChannel').value || null,
+      xp_min: parseInt(document.getElementById('lvlXpMin').value, 10),
+      xp_max: parseInt(document.getElementById('lvlXpMax').value, 10),
+      cooldown: parseInt(document.getElementById('lvlCooldown').value, 10),
       difficulty: parseFloat(document.getElementById('lvlDifficulty').value),
+      message: document.getElementById('lvlMessage').value,
     };
     const res = await api(`/api/guilds/${guildId}/leveling`, { method: 'PATCH', body: JSON.stringify(body) });
     if (res.ok) { status.textContent = 'Saved.'; status.className = 'save-status ok'; setBadge(lvlCard, body.enabled); }
-    else { status.textContent = 'Failed to save — try again.'; status.className = 'save-status err'; }
+    else { const data = await res.json(); status.textContent = data.error || 'Failed to save — try again.'; status.className = 'save-status err'; }
   };
 
   // ---------------- Anti-Nuke ----------------
