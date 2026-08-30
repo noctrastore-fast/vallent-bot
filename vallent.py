@@ -153,6 +153,16 @@ def load_config() -> dict:
         return default
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
+    data = _normalize_config(data)
+    save_config(data)
+    return data
+
+def _normalize_config(data: dict) -> dict:
+    """Fills in every key/sub-key a fresh install would have and runs the
+    per-guild migrations — shared by load_config() (startup) and the
+    `restoredata` command (restoring a backup made on another host, possibly
+    an older one) so both end up with an equally complete, current-shape
+    config."""
     data.setdefault("guilds",           {})
     data.setdefault("premium_users",    [])
     data.setdefault("premium_guilds",   [])
@@ -191,8 +201,9 @@ def load_config() -> dict:
     })
     for gid, gc in data.get("guilds", {}).items():
         _init_guild(gc)
-    save_config(data)
     return data
+
+
 
 def _init_guild(gc: dict):
     gc.setdefault("main_channel",      None)
@@ -1687,7 +1698,7 @@ async def _antispam_log(guild: discord.Guild, gc: dict, member: discord.Member, 
 # OWNER / PERMISSION HELPERS
 # ══════════════════════════════════════════════════════════════════
 
-OWNER_ONLY_CMDS = {"maintenance", "noprefix", "botrole", "grantpremium", "premiumlock", "blacklist", "vxleave", "vxservers", "vxguilds", "ownerhelp", "botstatus", "synccommands", "errorlog", "paymentmethods", "premiumorders"}
+OWNER_ONLY_CMDS = {"maintenance", "noprefix", "botrole", "grantpremium", "premiumlock", "blacklist", "vxleave", "vxservers", "vxguilds", "ownerhelp", "botstatus", "synccommands", "errorlog", "paymentmethods", "premiumorders", "backupdata", "restoredata"}
 
 def is_owner():
     async def predicate(ctx: commands.Context) -> bool:
@@ -6478,6 +6489,112 @@ async def pfx_premiumorders(ctx, action: str = "", order_id: str = ""):
             )
         lines.append("\nUse `premiumorders done <order_id>` once you've verified payment and granted access.")
         await ctx.send(embed=info_embed(f"Pending Website Orders ({len(pending)})", "\n".join(lines)))
+
+@bot.command(name="backupdata", aliases=["exportdata", "savebackup"])
+@is_owner()
+async def pfx_backupdata(ctx):
+    """Send the bot's ENTIRE data file (every server's settings, every
+    member's XP/level, premium status, custom badges, tickets, giveaways,
+    payment setup — literally everything persisted) as a single .json
+    attachment. Keep it somewhere safe; `restoredata` loads it straight
+    back in on a fresh host so nothing has to be set up from scratch
+    again."""
+    if not os.path.exists(CONFIG_PATH):
+        return await ctx.send(embed=error_embed("No data file found yet — there's nothing to back up."))
+    save_config(cfg)  # make sure what's on disk matches what's in memory before we ship it
+    size_kb = os.path.getsize(CONFIG_PATH) / 1024
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"vallentexs-backup-{stamp}.json"
+    summary = (
+        f"**{len(cfg.get('guilds', {}))}** servers · "
+        f"**{len(cfg.get('premium_users', []))}** premium users · "
+        f"**{sum(len(gc.get('members_xp', {})) for gc in cfg.get('guilds', {}).values())}** leveled members\n\n"
+        f"Keep this file safe. To move hosts: upload the bot's code to the new host, then run "
+        f"`restoredata` there with this file attached — everything comes back exactly as it was, "
+        f"no reconfiguring anything."
+    )
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            file = discord.File(f, filename=filename)
+            await ctx.author.send(embed=success_embed(f"Backup ready — {size_kb:.1f} KB\n\n{summary}"), file=file)
+        if ctx.guild is not None:
+            await ctx.send(embed=success_embed("Backup sent to your DMs."))
+    except discord.Forbidden:
+        with open(CONFIG_PATH, "rb") as f:
+            file = discord.File(f, filename=filename)
+            await ctx.send(embed=success_embed(f"Backup ready — {size_kb:.1f} KB\n\n{summary}"), file=file)
+
+@bot.command(name="restoredata", aliases=["importdata", "loadbackup"])
+@is_owner()
+async def pfx_restoredata(ctx):
+    """Load a backup made by `backupdata` — attach the .json file to the
+    message running this command. The bot's CURRENT data is backed up to
+    disk first (as a safety net) before it's replaced, and everything
+    applies immediately — no restart needed."""
+    if not ctx.message.attachments:
+        return await ctx.send(embed=error_embed(
+            "Attach the backup `.json` file to this message and run `restoredata` again — "
+            "get one anytime with `backupdata`."
+        ))
+    attachment = ctx.message.attachments[0]
+    if not attachment.filename.lower().endswith(".json"):
+        return await ctx.send(embed=error_embed("That doesn't look like a `.json` file."))
+    if attachment.size > 25 * 1024 * 1024:
+        return await ctx.send(embed=error_embed("That file is too large to be a valid backup."))
+
+    try:
+        raw = await attachment.read()
+        loaded = json.loads(raw.decode("utf-8"))
+    except Exception as ex:
+        return await ctx.send(embed=error_embed(f"Couldn't read that as JSON: `{ex}`"))
+    if not isinstance(loaded, dict) or "guilds" not in loaded:
+        return await ctx.send(embed=error_embed(
+            "That JSON doesn't look like a VALLENT EXS backup (missing the expected structure)."
+        ))
+
+    confirm_embed = info_embed(
+        "Confirm Restore",
+        (
+            f"This will **replace** the bot's entire current data with the uploaded backup "
+            f"(**{len(loaded.get('guilds', {}))}** servers in the file). "
+            f"The current data is backed up first, but this still fully overwrites everything live "
+            f"in memory right now.\n\nReact with ✅ within 30 seconds to confirm."
+        ),
+    )
+    confirm_msg = await ctx.send(embed=confirm_embed)
+    await confirm_msg.add_reaction("✅")
+    await confirm_msg.add_reaction("❌")
+
+    def check(reaction, user):
+        return user.id == ctx.author.id and reaction.message.id == confirm_msg.id and str(reaction.emoji) in ("✅", "❌")
+
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=30.0, check=check)
+    except asyncio.TimeoutError:
+        return await confirm_msg.edit(embed=error_embed("Restore cancelled — no confirmation received in time."))
+    if str(reaction.emoji) == "❌":
+        return await confirm_msg.edit(embed=error_embed("Restore cancelled."))
+
+    # Safety net: keep a dated copy of what was live right before the overwrite.
+    if os.path.exists(CONFIG_PATH):
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+        pre_restore_path = f"data/pre_restore_backup_{stamp}.json"
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as src, open(pre_restore_path, "w", encoding="utf-8") as dst:
+                dst.write(src.read())
+        except Exception:
+            logging.warning("Failed to write the pre-restore safety backup", exc_info=True)
+
+    normalized = _normalize_config(loaded)
+    cfg.clear()
+    cfg.update(normalized)
+    save_config(cfg)
+
+    await confirm_msg.edit(embed=success_embed(
+        f"Restored — **{len(cfg.get('guilds', {}))}** servers, "
+        f"**{len(cfg.get('premium_users', []))}** premium users loaded back in. "
+        f"Everything is live now, no restart needed."
+    ))
 
 
 @is_owner()
