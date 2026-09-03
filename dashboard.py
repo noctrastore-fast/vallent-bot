@@ -802,15 +802,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders:wght@700;900&family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root{
-    --void:#0a0605; --surface:#130b0c; --surface-2:#1c1112; --surface-3:#241618; --line:rgba(245,240,236,0.09); --line-2:rgba(245,240,236,0.16);
-    --crimson:#a80f2c; --crimson-deep:#3d0010; --crimson-glow:rgba(168,15,44,0.35);
-    --gold:#f5a623; --gold-glow:rgba(245,166,35,0.30);
+    --void:#0a0605; --surface:#130b0c; --surface-2:#1c1112; --surface-3:#241618;
+    --line:rgba(245,240,236,0.09); --line-2:rgba(245,240,236,0.16); --line-3:rgba(245,240,236,0.26);
+    --crimson:#a80f2c; --crimson-deep:#3d0010; --crimson-glow:rgba(168,15,44,0.35); --crimson-bright:#d81941;
+    --gold:#f5a623; --gold-deep:#b3760f; --gold-glow:rgba(245,166,35,0.30);
+    --violet:#7c3aed; --violet-glow:rgba(124,58,237,0.28);
     --ink:#f5f0ec; --muted:#a3908d; --muted-2:#6e5c5a;
-    --shadow-lg:0 26px 64px -22px rgba(0,0,0,0.68); --shadow-sm:0 10px 26px -14px rgba(0,0,0,0.55);
-    --radius-lg:16px; --radius-md:10px;
+    --shadow-lg:0 30px 70px -24px rgba(0,0,0,0.7); --shadow-sm:0 10px 26px -14px rgba(0,0,0,0.55);
+    --radius-lg:16px; --radius-md:12px; --radius-sm:8px;
+    --container:1180px;
   }
   *{ margin:0; padding:0; box-sizing:border-box; }
-  html{ scrollbar-color: var(--surface-3) var(--void); }
+  html{ scrollbar-color: var(--surface-3) var(--void); scroll-behavior:smooth; }
   body{
     background:var(--void); color:var(--ink); font-family:'Outfit',sans-serif; min-height:100vh;
     position:relative; overflow-x:hidden;
@@ -819,7 +822,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
     background-image: radial-gradient(circle at 12% 4%, var(--crimson-glow), transparent 30%),
                        radial-gradient(circle at 92% 90%, var(--gold-glow), transparent 36%);
-    opacity:0.22;
+    opacity:0.2;
+  }
+  body::after{
+    content:""; position:fixed; inset:0; z-index:0; pointer-events:none; mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+  }
+  .bg-grid{
+    position:fixed; inset:0; z-index:0; pointer-events:none; opacity:0.4;
+    background-image:linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size:64px 64px;
+    -webkit-mask-image:radial-gradient(ellipse 80% 50% at 50% 0%, #000 30%, transparent 75%);
+    mask-image:radial-gradient(ellipse 80% 50% at 50% 0%, #000 30%, transparent 75%);
   }
   nav, main{ position:relative; z-index:2; }
   ::selection{ background:var(--crimson); color:#fff; }
@@ -828,17 +842,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   ::-webkit-scrollbar-thumb{ background:var(--surface-3); border-radius:8px; border:2px solid var(--void); }
   a{ color:inherit; text-decoration:none; }
   a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible{ outline:2px solid var(--gold); outline-offset:2px; border-radius:4px; }
-  h1,h2,.display{ font-family:'Big Shoulders',sans-serif; font-weight:900; text-transform:uppercase; }
+  h1,h2,.display{ font-family:'Big Shoulders',sans-serif; font-weight:900; text-transform:uppercase; letter-spacing:-0.01em; }
   .mono{ font-family:'JetBrains Mono',monospace; }
-  .wrap{ max-width:960px; margin:0 auto; padding:0 28px; }
+  .wrap{ max-width:var(--container); margin:0 auto; padding:0 32px; }
+  @media (max-width:640px){ .wrap{ padding:0 20px; } }
   .hex{ width:38px; height:39px; clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%); display:flex; align-items:center; justify-content:center; background:linear-gradient(155deg,var(--crimson),var(--crimson-deep)); box-shadow:0 0 20px var(--crimson-glow); flex-shrink:0; }
   .hex span{ font-family:'Big Shoulders',sans-serif; font-weight:900; font-size:18px; }
-  nav{ border-bottom:1px solid var(--line); padding:18px 0; }
-  nav .row{ display:flex; align-items:center; justify-content:space-between; }
+  nav{
+    position:sticky; top:0; z-index:50; border-bottom:1px solid var(--line); padding:0;
+    background:rgba(10,6,5,0.72); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+  }
+  nav::after{ content:""; position:absolute; left:0; right:0; bottom:-1px; height:1px;
+    background:linear-gradient(90deg, transparent, var(--crimson-glow) 35%, var(--gold-glow) 65%, transparent); opacity:.6; }
+  nav .row{ display:flex; align-items:center; justify-content:space-between; height:72px; gap:20px; }
   .brand{ display:flex; align-items:center; gap:12px; font-family:'Big Shoulders',sans-serif; font-weight:700; font-size:18px; letter-spacing:0.02em; }
   .brand b{ color:var(--gold); }
+  .brand-site-link{ font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:6px; transition:color .2s ease; }
+  .brand-site-link:hover{ color:var(--ink); }
+  @media (max-width:640px){ .brand-site-link{ display:none; } }
   .userchip{ display:flex; align-items:center; gap:10px; font-size:13px; color:var(--muted); }
-  .userchip img{ width:28px; height:28px; border-radius:50%; }
+  .userchip img{ width:28px; height:28px; border-radius:50%; border:1px solid var(--line-2); }
   .btn{ display:inline-flex; align-items:center; gap:8px; padding:10px 20px; font-weight:600; font-size:13px; border-radius:6px; border:none; cursor:pointer;
     position:relative; overflow:hidden; isolation:isolate; transition:transform .18s ease, box-shadow .18s ease, opacity .18s ease; }
   .btn::before{ content:""; position:absolute; inset:0; background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,0.22) 48%,transparent 66%); transform:translateX(-130%); transition:transform .5s ease; z-index:1; pointer-events:none; }
@@ -846,42 +869,79 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .btn:hover{ transform:translateY(-1px); }
   .btn:disabled{ opacity:0.45; cursor:not-allowed; transform:none; }
   .btn:disabled::before{ display:none; }
-  .btn-primary{ background:linear-gradient(135deg,var(--crimson) 0%,#7a0d22 55%,#4a0714 100%); color:#fff; box-shadow:0 10px 26px -12px var(--crimson-glow); }
+  .btn-sm{ padding:8px 16px; font-size:12.5px; }
+  .btn-primary{ background:linear-gradient(135deg,var(--crimson-bright) 0%,var(--crimson) 55%,#4a0714 100%); color:#fff; box-shadow:0 10px 26px -12px var(--crimson-glow); }
   .btn-primary:hover{ box-shadow:0 16px 34px -10px var(--crimson-glow); }
-  .btn-ghost{ background:transparent; border:1px solid var(--line); color:var(--ink); }
+  .btn-ghost{ background:rgba(245,240,236,0.03); border:1px solid var(--line); color:var(--ink); }
   .btn-ghost:hover{ border-color:var(--line-2); }
-  .btn-gold{ background:linear-gradient(135deg,var(--gold),#b3760f); color:#160b02; box-shadow:0 10px 24px -12px var(--gold-glow); }
-  main{ padding:56px 0 100px; }
-  .loading{ text-align:center; padding:80px 0; color:var(--muted-2); font-size:14px; }
-  .login-card{ max-width:420px; margin:80px auto; text-align:center; padding:48px 32px; border:1px solid var(--line); border-radius:var(--radius-lg); background:var(--surface); box-shadow:var(--shadow-lg); }
+  .btn-gold{ background:linear-gradient(135deg,var(--gold),var(--gold-deep)); color:#160b02; box-shadow:0 10px 24px -12px var(--gold-glow); }
+  main{ padding:48px 0 120px; min-height:calc(100vh - 72px); }
+  .loading{ text-align:center; padding:120px 0; color:var(--muted-2); font-size:14px; }
+  .login-card{ max-width:420px; margin:100px auto; text-align:center; padding:48px 32px; border:1px solid var(--line); border-radius:var(--radius-lg); background:var(--surface); box-shadow:var(--shadow-lg); }
   .login-card h1{ font-size:26px; margin:18px 0 10px; }
   .login-card p{ color:var(--muted); font-size:14px; margin-bottom:28px; line-height:1.6; }
-  .guild-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; margin-top:28px; }
-  .guild-card{ background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:20px; cursor:pointer; transition:border-color .2s, transform .2s; display:flex; align-items:center; gap:12px; }
-  .guild-card:hover{ border-color:rgba(245,240,236,0.2); transform:translateY(-2px); }
+
+  /* ================= APP SHELL (guild editor: sidebar + content) ================= */
+  .app-shell{ display:flex; align-items:flex-start; gap:0; margin:-48px 0 0; min-height:calc(100vh - 120px); }
+  .app-sidebar{
+    width:272px; flex-shrink:0; position:sticky; top:72px; height:calc(100vh - 72px); overflow-y:auto;
+    border-right:1px solid var(--line); padding:44px 20px 40px; background:rgba(19,11,12,0.4); margin-right:40px;
+  }
+  @media (max-width:900px){
+    .app-shell{ flex-direction:column; margin-top:-28px; }
+    .app-sidebar{ width:100%; position:relative; top:0; height:auto; border-right:none; border-bottom:1px solid var(--line); padding:20px; margin-right:0; }
+    .sidebar-nav{ flex-direction:row !important; overflow-x:auto; gap:6px !important; }
+    .sidebar-item{ flex-shrink:0; }
+  }
+  .sidebar-back{ display:inline-flex; align-items:center; gap:6px; font-size:12.5px; color:var(--muted); margin-bottom:20px; transition:color .2s ease; }
+  .sidebar-back:hover{ color:var(--ink); }
+  .sidebar-guild-chip{ display:flex; align-items:center; gap:11px; padding:10px; border-radius:10px; background:var(--surface); border:1px solid var(--line); margin-bottom:28px; }
+  .sidebar-guild-chip img{ width:32px; height:32px; border-radius:8px; flex-shrink:0; object-fit:cover; }
+  .sidebar-guild-chip .no-icon{ width:32px; height:32px; border-radius:8px; background:var(--surface-2); flex-shrink:0; }
+  .sidebar-guild-chip .name{ font-size:13.5px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sidebar-label{ font-size:11px; color:var(--muted-2); text-transform:uppercase; letter-spacing:0.1em; font-weight:600; margin-bottom:12px; padding:0 4px; }
+  .sidebar-nav{ display:flex; flex-direction:column; gap:2px; }
+  .sidebar-item{
+    display:flex; align-items:center; gap:11px; padding:11px 12px; border-radius:9px; border:none; background:transparent;
+    color:var(--muted); font-family:'Outfit',sans-serif; font-size:13.5px; font-weight:500; cursor:pointer; text-align:left; width:100%;
+    transition:background .18s ease, color .18s ease;
+  }
+  .sidebar-item:hover{ background:var(--surface); color:var(--ink); }
+  .sidebar-item.active{ background:var(--surface-2); color:var(--ink); box-shadow:inset 2px 0 0 var(--gold); }
+  .sidebar-item svg{ width:16px; height:16px; flex-shrink:0; opacity:0.85; }
+  .sidebar-item-label{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sidebar-dot{ width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+  .sidebar-dot.on{ background:#4ade80; }
+  .sidebar-dot.off{ background:var(--muted-2); }
+  .sidebar-dot.neutral{ background:var(--gold); }
+  .sidebar-item.disabled{ opacity:0.4; cursor:not-allowed; }
+  .sidebar-item.disabled:hover{ background:transparent; color:var(--muted); }
+  .sidebar-divider{ height:1px; background:var(--line); margin:16px 4px; }
+  .sidebar-soon{ font-size:9.5px; text-transform:uppercase; letter-spacing:0.06em; color:var(--muted-2); background:var(--surface-2); padding:2px 7px; border-radius:100px; flex-shrink:0; }
+
+  .app-content{ flex:1; min-width:0; padding:44px 40px 0; max-width:920px; }
+  @media (max-width:900px){ .app-content{ padding:32px 20px 0; max-width:none; } }
+  .content-panel{ display:none; }
+  .content-panel.active{ display:block; animation:panelFadeIn .35s ease; }
+  @keyframes panelFadeIn{ from{ opacity:0; transform:translateY(8px); } to{ opacity:1; transform:translateY(0); } }
+  .panel-page-head{ display:flex; align-items:center; gap:16px; margin-bottom:32px; }
+  .panel-page-icon{ width:46px; height:46px; border-radius:11px; background:var(--surface-2); border:1px solid var(--line); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+  .panel-page-icon svg{ width:21px; height:21px; }
+  .panel-page-head h1{ font-family:'Outfit',sans-serif; text-transform:none; font-weight:700; font-size:22px; letter-spacing:0; margin-bottom:2px; }
+  .panel-page-head p{ font-size:13px; color:var(--muted-2); }
+  .panel-page-head .status-badge{ margin-left:auto; }
+  .guild-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:16px; margin-top:28px; }
+  .guild-card{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-md); padding:20px; cursor:pointer; transition:border-color .2s ease, transform .2s ease, box-shadow .2s ease; display:flex; align-items:center; gap:14px; box-shadow:var(--shadow-sm); }
+  .guild-card:hover{ border-color:var(--line-3); transform:translateY(-3px); box-shadow:var(--shadow-lg); }
+  .guild-icon{ width:44px; height:44px; border-radius:50%; background:var(--surface-2); flex-shrink:0; object-fit:cover; border:1px solid var(--line-2); }
+  .page-title{ font-size:clamp(28px,3.4vw,38px); margin-bottom:8px; }
+  .page-sub{ color:var(--muted); font-size:14.5px; margin-bottom:40px; line-height:1.6; max-width:560px; }
   .guild-card.disabled{ opacity:0.45; cursor:not-allowed; }
-  .guild-icon{ width:40px; height:40px; border-radius:50%; background:var(--surface-2); flex-shrink:0; object-fit:cover; }
   .guild-name{ font-size:14px; font-weight:600; }
   .guild-note{ font-size:11px; color:var(--muted-2); margin-top:2px; }
-  .page-title{ font-size:32px; margin-bottom:6px; }
-  .page-sub{ color:var(--muted); font-size:14px; margin-bottom:36px; }
-  .sys-card{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-lg); margin-bottom:14px; overflow:hidden; box-shadow:var(--shadow-sm); transition:border-color .2s ease; }
-  .sys-card:hover{ border-color:var(--line-2); }
-  .sys-card-head{ display:flex; align-items:center; gap:14px; padding:20px 24px; cursor:pointer; user-select:none; }
-  .sys-card-head:hover{ background:rgba(255,255,255,0.02); }
-  .sys-card-icon{ width:38px; height:38px; border-radius:9px; background:var(--surface-2); border:1px solid var(--line); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
-  .sys-card-icon svg{ width:18px; height:18px; }
-  .sys-card-title{ flex:1; min-width:0; }
-  .sys-card-title h2{ font-family:'Outfit',sans-serif; text-transform:none; font-weight:700; font-size:16px; letter-spacing:0; margin-bottom:2px; }
-  .sys-card-title p{ font-size:12.5px; color:var(--muted-2); }
   .status-badge{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; padding:4px 10px; border-radius:20px; flex-shrink:0; }
   .status-badge.on{ background:rgba(74,222,128,0.15); color:#4ade80; }
   .status-badge.off{ background:rgba(255,255,255,0.06); color:var(--muted-2); }
-  .sys-card-chevron{ width:20px; height:20px; flex-shrink:0; transition:transform .2s ease; color:var(--muted); }
-  .sys-card.open .sys-card-chevron{ transform:rotate(180deg); }
-  .sys-card-body{ max-height:0; overflow:hidden; transition:max-height .25s ease; }
-  .sys-card.open .sys-card-body{ max-height:2000px; }
-  .sys-card-body-inner{ padding:4px 24px 26px; border-top:1px solid var(--line); padding-top:22px; }
 
   .panel{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-lg); padding:28px; margin-bottom:20px; box-shadow:var(--shadow-sm); }
   .panel-head{ display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; }
@@ -1033,7 +1093,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <nav><div class="wrap row">
-  <div class="brand"><div class="hex"><span>V</span></div>VALLENT <b>EXS</b> <span class="mono" style="font-size:11px;color:var(--muted-2);margin-left:4px;">DASHBOARD</span></div>
+  <div style="display:flex;align-items:center;gap:20px;">
+    <a href="/dashboard" class="brand"><div class="hex"><span>V</span></div>VALLENT <b>EXS</b> <span class="mono" style="font-size:11px;color:var(--muted-2);margin-left:4px;">DASHBOARD</span></a>
+    <a href="https://vallentexs.web.id" class="brand-site-link">&larr; Back to site</a>
+  </div>
   <div id="navRight"></div>
 </div></nav>
 <main class="wrap" id="app"><div class="loading">Loading…</div></main>
@@ -1361,29 +1424,13 @@ function badgeHtml(enabled) {
   return `<span class="status-badge ${enabled ? 'on' : 'off'}" data-badge>${enabled ? 'Enabled' : 'Disabled'}</span>`;
 }
 
-function makeSysCard(icon, title, subtitle, enabled, bodyHtml) {
-  const card = el(`
-    <div class="sys-card">
-      <div class="sys-card-head">
-        <div class="sys-card-icon">${icon}</div>
-        <div class="sys-card-title"><h2>${title}</h2><p>${subtitle}</p></div>
-        ${badgeHtml(enabled)}
-        <svg class="sys-card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
-      </div>
-      <div class="sys-card-body"><div class="sys-card-body-inner">${bodyHtml}</div></div>
-    </div>
-  `);
-  card.querySelector('.sys-card-head').addEventListener('click', () => card.classList.toggle('open'));
-  return card;
-}
-
 function setBadge(card, enabled) {
   const badge = card.querySelector('[data-badge]');
   badge.textContent = enabled ? 'Enabled' : 'Disabled';
   badge.className = `status-badge ${enabled ? 'on' : 'off'}`;
 }
 
-async function renderGuildEditor(guildId) {
+async function renderGuildEditor(guildId, me) {
   app.innerHTML = '<div class="loading">Loading server settings…</div>';
   const [lvlRes, chRes, rolesRes, catRes, anRes, asRes, tixRes] = await Promise.all([
     api(`/api/guilds/${guildId}/leveling`),
@@ -1405,15 +1452,65 @@ async function renderGuildEditor(guildId) {
   const an = await anRes.json();
   const as_ = await asRes.json();
   const tix = await tixRes.json();
+  const guildMeta = (me && me.guilds || []).find(g => g.id === guildId);
 
   app.innerHTML = '';
-  app.appendChild(el(`<a href="/dashboard" class="back-link">&larr; All Servers</a>`));
-  app.appendChild(el(`<h1 class="page-title">Server Settings</h1><p class="page-sub">Click a system below to open its settings. More systems (Moderation, Verification...) are on the way.</p>`));
+  const shell = el(`<div class="app-shell"></div>`);
+  const sidebar = el(`
+    <aside class="app-sidebar">
+      <a href="/dashboard" class="sidebar-back">&larr; All Servers</a>
+      <div class="sidebar-guild-chip">
+        ${guildMeta && guildMeta.icon ? `<img src="${guildMeta.icon}">` : `<div class="no-icon"></div>`}
+        <div class="name">${guildMeta ? guildMeta.name : 'Server Settings'}</div>
+      </div>
+      <div class="sidebar-label">Systems</div>
+      <nav class="sidebar-nav" id="sidebarNav"></nav>
+    </aside>
+  `);
+  const content = el(`<main class="app-content" id="appContent"></main>`);
+  shell.appendChild(sidebar);
+  shell.appendChild(content);
+  app.appendChild(shell);
+  const sidebarNav = sidebar.querySelector('#sidebarNav');
+
+  function addSidebarItem(key, iconSvg, label, dotClass) {
+    const btn = el(`
+      <button class="sidebar-item" data-target="${key}">
+        ${iconSvg}<span class="sidebar-item-label">${label}</span><span class="sidebar-dot ${dotClass}"></span>
+      </button>
+    `);
+    btn.onclick = () => showSystem(key);
+    sidebarNav.appendChild(btn);
+    return btn;
+  }
+  function addSidebarComingSoon(iconSvg, label) {
+    sidebarNav.appendChild(el(`
+      <div class="sidebar-item disabled">${iconSvg}<span class="sidebar-item-label">${label}</span><span class="sidebar-soon">Soon</span></div>
+    `));
+  }
+  function showSystem(key) {
+    sidebarNav.querySelectorAll('.sidebar-item').forEach(b => b.classList.toggle('active', b.getAttribute('data-target') === key));
+    content.querySelectorAll('.content-panel').forEach(p => p.classList.toggle('active', p.getAttribute('data-panel') === key));
+  }
+  function makePanelPage(key, icon, title, subtitle, enabled, bodyHtml) {
+    const pane = el(`
+      <div class="content-panel" data-panel="${key}">
+        <div class="panel-page-head">
+          <div class="panel-page-icon">${icon}</div>
+          <div><h1>${title}</h1><p>${subtitle}</p></div>
+          ${badgeHtml(enabled)}
+        </div>
+        <div class="panel">${bodyHtml}</div>
+      </div>
+    `);
+    content.appendChild(pane);
+    return pane;
+  }
 
   // ---------------- Level & XP ----------------
   const roleOptions = (selectedId) => roles.map(r => `<option value="${r.id}" ${selectedId === r.id ? 'selected' : ''}>@${r.name}</option>`).join('');
 
-  const lvlCard = makeSysCard('<svg viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="1.6"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>', 'Level &amp; XP', 'XP gain, level-up announcements, difficulty', lvl.enabled, `
+  const lvlCard = makePanelPage('leveling', '<svg viewBox="0 0 24 24" fill="none" stroke="#f5a623" stroke-width="1.6"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>', 'Level &amp; XP', 'XP gain, level-up announcements, difficulty', lvl.enabled, `
     <div class="field">
       <label>Enabled</label>
       <label class="toggle"><input type="checkbox" id="lvlEnabled" ${lvl.enabled ? 'checked' : ''}><span class="toggle-slider"></span></label>
@@ -1464,7 +1561,6 @@ async function renderGuildEditor(guildId) {
       <span class="save-status" id="lvlRewardStatus"></span>
     </div>
   `);
-  app.appendChild(lvlCard);
 
   function renderNoxpList(list) {
     const box = lvlCard.querySelector('#noxpList');
@@ -1555,7 +1651,7 @@ async function renderGuildEditor(guildId) {
   };
 
   // ---------------- Anti-Nuke ----------------
-  const anCard = makeSysCard('<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>', 'Anti-Nuke', 'Raid protection, mass-action detection', an.enabled, `
+  const anCard = makePanelPage('antinuke', '<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>', 'Anti-Nuke', 'Raid protection, mass-action detection', an.enabled, `
     <div class="field">
       <label>Enabled</label>
       <label class="toggle"><input type="checkbox" id="anEnabled" ${an.enabled ? 'checked' : ''}><span class="toggle-slider"></span></label>
@@ -1590,7 +1686,6 @@ async function renderGuildEditor(guildId) {
       <span class="save-status" id="wlStatus"></span>
     </div>
   `);
-  app.appendChild(anCard);
 
   function renderWhitelist(list) {
     const wlList = anCard.querySelector('#wlList');
@@ -1644,7 +1739,7 @@ async function renderGuildEditor(guildId) {
   };
 
   // ---------------- Antispam ----------------
-  const asCard = makeSysCard('<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>', 'Antispam', 'Flood &amp; cross-channel spam detection', null, `
+  const asCard = makePanelPage('antispam', '<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>', 'Antispam', 'Flood &amp; cross-channel spam detection', null, `
     <div class="field">
       <label>Honeypot / Trap Channel</label>
       <select id="asTrapChannel">
@@ -1706,7 +1801,6 @@ async function renderGuildEditor(guildId) {
       <span class="save-status" id="asRoleStatus"></span>
     </div>
   `);
-  app.appendChild(asCard);
 
   function renderIgnoreUsers(list) {
     const box = asCard.querySelector('#asUserList');
@@ -2002,8 +2096,7 @@ async function renderGuildEditor(guildId) {
 
   const tixBody = tabsHtml + `<div class="tix-panes">` + existingPanes + newPane + `</div>`;
 
-  const tixCard = makeSysCard('<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M4 10h16"/></svg>', 'Ticket System', 'Support panels, categories, staff roles', tixBadge, tixBody);
-  app.appendChild(tixCard);
+  const tixCard = makePanelPage('tickets', '<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M4 10h16"/></svg>', 'Ticket System', 'Support panels, categories, staff roles', tixBadge, tixBody);
 
   // ---- tab switching ----
   const tixTabBtns = tixCard.querySelectorAll('.tix-tab');
@@ -2052,7 +2145,7 @@ async function renderGuildEditor(guildId) {
       };
       const res = await api(`/api/guilds/${guildId}/tickets`, { method: 'POST', body: JSON.stringify(body) });
       const data = await res.json();
-      if (res.ok) { status.textContent = 'Posted.'; status.className = 'save-status exPostStatus ok'; setTimeout(() => renderGuildEditor(guildId), 700); }
+      if (res.ok) { status.textContent = 'Posted.'; status.className = 'save-status exPostStatus ok'; setTimeout(() => renderGuildEditor(guildId, me), 700); }
       else { status.textContent = data.error || 'Failed to post — try again.'; status.className = 'save-status exPostStatus err'; }
     };
   });
@@ -2079,18 +2172,20 @@ async function renderGuildEditor(guildId) {
       };
       const res = await api(`/api/guilds/${guildId}/tickets`, { method: 'POST', body: JSON.stringify(body) });
       const data = await res.json();
-      if (res.ok) { status.textContent = 'Posted! Reloading...'; status.className = 'save-status ok'; setTimeout(() => renderGuildEditor(guildId), 700); }
+      if (res.ok) { status.textContent = 'Posted! Reloading...'; status.className = 'save-status ok'; setTimeout(() => renderGuildEditor(guildId, me), 700); }
       else { status.textContent = data.error || 'Failed to post — try again.'; status.className = 'save-status err'; }
     };
   })();
 
-  // ---------------- Coming soon ----------------
-  app.appendChild(el(`
-    <div class="panel" style="opacity:0.5;">
-      <div class="panel-head"><h2>Moderation, Verification &amp; more</h2></div>
-      <div class="soon-note">Coming in a future update — for now, configure these with commands in Discord.</div>
-    </div>
-  `));
+  // ---------------- Sidebar registration + default view ----------------
+  addSidebarItem('leveling', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>', 'Level & XP', lvl.enabled ? 'on' : 'off');
+  addSidebarItem('antinuke', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>', 'Anti-Nuke', an.enabled ? 'on' : 'off');
+  addSidebarItem('antispam', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>', 'Antispam', 'neutral');
+  addSidebarItem('tickets', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M4 10h16"/></svg>', 'Ticket System', tix.panels.length ? 'on' : 'off');
+  sidebarNav.appendChild(el(`<div class="sidebar-divider"></div>`));
+  addSidebarComingSoon('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/></svg>', 'Moderation');
+  addSidebarComingSoon('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M9 12l2 2 4-4M7.5 3.5L12 2l4.5 1.5L18 8l-1 8-5 4-5-4-1-8z"/></svg>', 'Verification');
+  showSystem('leveling');
 }
 
 async function boot() {
@@ -2103,7 +2198,7 @@ async function boot() {
   if (parts.length === 2 && parts[0] === 'dashboard' && parts[1] === 'checkout') {
     renderCheckout(me);
   } else if (parts.length === 2 && parts[0] === 'dashboard') {
-    renderGuildEditor(parts[1]);
+    renderGuildEditor(parts[1], me);
   } else {
     renderGuildPicker(me);
   }
