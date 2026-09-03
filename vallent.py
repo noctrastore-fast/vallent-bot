@@ -1070,6 +1070,184 @@ async def start_vote_webhook_server():
                 gc.get("level_roles", {}).pop(str(level), None)
                 save_config(cfg)
 
+            def _get_tickets(guild_id: int) -> dict:
+                gc = guild_cfg(cfg, guild_id)
+                guild = bot.get_guild(guild_id)
+                panels = []
+                for pid, p in gc["ticket"]["panels"].items():
+                    cat = guild.get_channel(p.get("category")) if guild and p.get("category") else None
+                    log_ch = guild.get_channel(p.get("log_channel")) if guild and p.get("log_channel") else None
+                    role = guild.get_role(p.get("support_role")) if guild and p.get("support_role") else None
+                    post_ch = guild.get_channel(p.get("channel_id")) if guild and p.get("channel_id") else None
+                    color_int = p.get("color") or COLOR_PRIMARY
+                    panels.append({
+                        "id": pid,
+                        "title": p.get("title") or "Support Tickets",
+                        "description": p.get("description") or "",
+                        "welcome_message": p.get("welcome_message") or "",
+                        "category_id": str(p["category"]) if p.get("category") else None,
+                        "category_name": cat.name if cat else None,
+                        "log_channel_id": str(p["log_channel"]) if p.get("log_channel") else None,
+                        "log_channel_name": log_ch.name if log_ch else None,
+                        "support_role_id": str(p["support_role"]) if p.get("support_role") else None,
+                        "support_role_name": role.name if role else None,
+                        "max_tickets": p.get("max_tickets", 1),
+                        "thumbnail": p.get("thumbnail") or "",
+                        "image": p.get("image") or "",
+                        "color": f"{color_int:06X}",
+                        "button_label": p.get("button_label") or "Open Ticket",
+                        "button_emoji": p.get("button_emoji") or "",
+                        "button_style": p.get("button_style") or "danger",
+                        "open_type": p.get("open_type") or "button",
+                        "is_live": bool(p.get("message_id") and p.get("channel_id")),
+                        "post_channel_id": str(p["channel_id"]) if p.get("channel_id") else None,
+                        "post_channel_name": post_ch.name if post_ch else None,
+                        "types_count": len(p.get("types") or {}),
+                    })
+                panels.sort(key=lambda x: x["id"])
+                return {"panels": panels}
+
+            def _apply_ticket_fields(panel: dict, fields: dict) -> Optional[str]:
+                """Shared validation + assignment for both a settings-only save
+                and a full send/post — one place so the two paths can never
+                drift out of sync on what counts as a valid value."""
+                if "title" in fields:
+                    panel["title"] = (fields.get("title") or "Support Tickets").strip()[:256]
+                if "description" in fields:
+                    panel["description"] = (fields.get("description") or "Click the button below to open a support ticket.").strip()[:2000]
+                if "welcome_message" in fields:
+                    panel["welcome_message"] = (fields.get("welcome_message") or "").strip()[:1500] or None
+                if "category_id" in fields:
+                    panel["category"] = int(fields["category_id"]) if fields.get("category_id") else None
+                if "log_channel_id" in fields:
+                    panel["log_channel"] = int(fields["log_channel_id"]) if fields.get("log_channel_id") else None
+                if "support_role_id" in fields:
+                    panel["support_role"] = int(fields["support_role_id"]) if fields.get("support_role_id") else None
+                if "max_tickets" in fields:
+                    try:
+                        mt = int(fields["max_tickets"])
+                    except (TypeError, ValueError):
+                        return "Max tickets per user must be a whole number."
+                    if not (1 <= mt <= 5):
+                        return "Max tickets per user must be between 1 and 5."
+                    panel["max_tickets"] = mt
+                if "thumbnail" in fields:
+                    url = (fields.get("thumbnail") or "").strip()
+                    if url and not url.startswith(("http://", "https://")):
+                        return "Thumbnail must be a direct image URL."
+                    panel["thumbnail"] = url or None
+                if "image" in fields:
+                    url = (fields.get("image") or "").strip()
+                    if url and not url.startswith(("http://", "https://")):
+                        return "Banner must be a direct image URL."
+                    panel["image"] = url or None
+                if "color" in fields:
+                    raw = (fields.get("color") or "").strip()
+                    if raw:
+                        parsed = parse_hex_color(raw)
+                        if not parsed:
+                            return "That doesn't look like a valid hex color."
+                        panel["color"] = int(raw.lstrip("#"), 16)
+                    else:
+                        panel["color"] = COLOR_PRIMARY
+                if "button_label" in fields:
+                    panel["button_label"] = (fields.get("button_label") or "Open Ticket").strip()[:80]
+                if "button_emoji" in fields:
+                    panel["button_emoji"] = (fields.get("button_emoji") or "").strip()
+                if "button_style" in fields:
+                    style = (fields.get("button_style") or "danger").strip()
+                    if style not in BUTTON_STYLES:
+                        return "Invalid button style."
+                    panel["button_style"] = style
+                if "open_type" in fields:
+                    ot = (fields.get("open_type") or "button").strip()
+                    if ot not in ("button", "dropdown"):
+                        return "Invalid open type."
+                    panel["open_type"] = ot
+                return None
+
+            def _set_ticket_panel(guild_id: int, panel_id: str, update: dict) -> Optional[str]:
+                gc = guild_cfg(cfg, guild_id)
+                panels = gc["ticket"]["panels"]
+                if panel_id not in panels:
+                    return "That panel doesn't exist — create it below or with /ticketpanel in Discord."
+                panel = panels[panel_id]
+                err = _apply_ticket_fields(panel, update)
+                if err:
+                    return err
+                save_config(cfg)
+
+                # Keep the live panel message in sync, if it's already been posted.
+                if panel.get("message_id") and panel.get("channel_id"):
+                    guild = bot.get_guild(guild_id)
+
+                    async def _refresh_panel():
+                        try:
+                            channel = guild.get_channel(panel["channel_id"]) or await guild.fetch_channel(panel["channel_id"])
+                            message = await channel.fetch_message(panel["message_id"])
+                            await message.edit(view=TicketPanelLayout(panel_id, panel, guild))
+                        except Exception:
+                            logging.warning(f"Failed to refresh live ticket panel '{panel_id}' after a dashboard edit", exc_info=True)
+
+                    if guild:
+                        asyncio.create_task(_refresh_panel())
+                return None
+
+            async def _send_ticket_panel(guild_id: int, panel_id: str, fields: dict, post_channel_id: int) -> Optional[str]:
+                """Create a brand-new panel (posting it for the first time) OR
+                move/repost an existing one to a different channel — same
+                mechanics `/ticketpanel`'s builder uses: if the panel already
+                has a live message, that message is edited in place instead of
+                double-posting, and only falls back to a fresh post if the old
+                message is gone."""
+                panel_id = (panel_id or "").lower().strip()
+                if not re.fullmatch(r"[a-z0-9_-]{1,32}", panel_id):
+                    return "Panel ID can only use lowercase letters, numbers, - and _ (max 32 characters)."
+                guild = bot.get_guild(guild_id)
+                if not guild:
+                    return "Couldn't find that server right now — try again in a moment."
+                post_channel = guild.get_channel(post_channel_id)
+                if not post_channel:
+                    return "Couldn't find that channel to post the panel in."
+
+                gc = guild_cfg(cfg, guild_id)
+                panels = gc["ticket"]["panels"]
+                panel = panels.setdefault(panel_id, {})
+                err = _apply_ticket_fields(panel, fields)
+                if err:
+                    return err
+                if not panel.get("category"):
+                    return "Pick a ticket category."
+                if not panel.get("log_channel"):
+                    return "Pick a log channel."
+                panel.setdefault("max_tickets", 1)
+
+                old_channel_id = panel.get("channel_id")
+                old_message_id = panel.get("message_id")
+                edited_existing = False
+                if old_channel_id and old_message_id:
+                    old_channel = guild.get_channel(old_channel_id)
+                    if old_channel:
+                        try:
+                            old_msg = await old_channel.fetch_message(old_message_id)
+                            await old_msg.edit(view=TicketPanelLayout(panel_id, panel, guild=guild))
+                            edited_existing = True
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            edited_existing = False
+
+                if not edited_existing:
+                    try:
+                        msg = await post_channel.send(view=TicketPanelLayout(panel_id, panel, guild=guild))
+                    except discord.Forbidden:
+                        return "I don't have permission to send messages in that channel."
+                    except discord.HTTPException as ex:
+                        return f"Discord rejected the panel message: {ex}"
+                    panel["message_id"], panel["channel_id"] = msg.id, post_channel.id
+
+                save_config(cfg)
+                bot.add_view(TicketPanelLayout(panel_id, panel, guild=guild))
+                return None
+
             def _get_antinuke(guild_id: int) -> dict:
                 gc = guild_cfg(cfg, guild_id)
                 ac = gc.get("antinuke", {})
@@ -1337,6 +1515,9 @@ async def start_vote_webhook_server():
                 remove_leveling_noxp_role=_remove_leveling_noxp_role,
                 set_leveling_role_reward=_set_leveling_role_reward,
                 remove_leveling_role_reward=_remove_leveling_role_reward,
+                get_tickets=_get_tickets,
+                set_ticket_panel=_set_ticket_panel,
+                send_ticket_panel=_send_ticket_panel,
                 get_antinuke=_get_antinuke,
                 set_antinuke=_set_antinuke,
                 add_antinuke_whitelist=_add_antinuke_whitelist,

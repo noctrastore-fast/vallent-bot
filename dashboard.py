@@ -41,7 +41,7 @@ import json
 import re
 import time
 import logging
-from typing import Callable, Optional
+from typing import Callable, Optional, Awaitable
 from urllib.parse import urlencode
 
 import aiohttp
@@ -100,6 +100,9 @@ def build_dashboard_routes(
     remove_leveling_noxp_role: Callable[[int, int], None],
     set_leveling_role_reward: Callable[[int, int, int], Optional[str]],
     remove_leveling_role_reward: Callable[[int, int], None],
+    get_tickets: Callable[[int], dict],
+    set_ticket_panel: Callable[[int, str, dict], Optional[str]],
+    send_ticket_panel: Callable[[int, str, dict, int], Awaitable[Optional[str]]],
     get_antinuke: Callable[[int], dict],
     set_antinuke: Callable[[int, dict], Optional[str]],
     add_antinuke_whitelist: Callable[[int, int], Optional[str]],
@@ -126,6 +129,18 @@ def build_dashboard_routes(
       - add/remove_leveling_noxp_role(guild_id, role_id) -> mutate the no-XP role list by one role
       - set_leveling_role_reward(guild_id, level, role_id) -> upsert one level's role reward; returns an error string or None
       - remove_leveling_role_reward(guild_id, level) -> remove one level's role reward
+      - get_tickets(guild_id) -> {"panels": [{"id","title","description","welcome_message","category_id",
+        "category_name","log_channel_id","log_channel_name","support_role_id","support_role_name",
+        "max_tickets","thumbnail","image","color","button_label","button_emoji","button_style",
+        "open_type","is_live","post_channel_id","post_channel_name","types_count"}]}
+      - set_ticket_panel(guild_id, panel_id, dict) -> settings-only update on a panel that already
+        exists; applies + persists, and refreshes the live panel message in place if there is one.
+        Returns an error string or None.
+      - send_ticket_panel(guild_id, panel_id, dict, post_channel_id) -> ASYNC (await this one).
+        Creates a brand-new panel and posts it, OR updates + reposts/moves an existing one — same
+        mechanics as the /ticketpanel builder's own Send/Update step (edits the existing live message
+        in place if it's still there, otherwise posts fresh in post_channel_id). Returns an error
+        string or None.
       - get_antinuke(guild_id)       -> {"enabled", "log_channel", "punishment", "whitelist": [...], "bot_has_audit_log_perm"}
       - set_antinuke(guild_id, dict) -> applies + persists a partial update; returns an error string or None
       - add/remove_antinuke_whitelist(guild_id, user_id) -> mutate the whitelist by one user
@@ -338,6 +353,79 @@ def build_dashboard_routes(
         roles = [{"id": str(r.id), "name": r.name} for r in guild.roles if not r.is_default()]
         roles.sort(key=lambda r: r["name"].lower())
         return web.json_response(roles)
+
+    async def api_guild_categories(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        bot = get_bot()
+        guild = bot.get_guild(int(guild_id))
+        cats = [{"id": str(c.id), "name": c.name} for c in guild.categories]
+        cats.sort(key=lambda c: c["name"].lower())
+        return web.json_response(cats)
+
+    async def api_get_tickets(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        return web.json_response(get_tickets(int(guild_id)))
+
+    def _extract_ticket_fields(body: dict) -> dict:
+        fields = {}
+        for key in ("title", "description", "welcome_message", "thumbnail", "image", "color", "button_label", "button_emoji", "button_style", "open_type"):
+            if key in body:
+                fields[key] = str(body[key]) if body[key] is not None else ""
+        for key in ("category_id", "log_channel_id", "support_role_id"):
+            if key in body:
+                fields[key] = str(body[key]) if body[key] else None
+        if "max_tickets" in body:
+            fields["max_tickets"] = body["max_tickets"]
+        return fields
+
+    async def api_patch_ticket_panel(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        panel_id = request.match_info["panel_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        update = _extract_ticket_fields(body)
+        error = set_ticket_panel(int(guild_id), panel_id, update)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_tickets(int(guild_id)))
+
+    async def api_post_ticket_panel(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        panel_id = str(body.get("panel_id", "")).strip()
+        post_channel_id = body.get("post_channel_id")
+        if not panel_id or not post_channel_id:
+            return web.json_response({"error": "Pick a panel ID and a channel to post in."}, status=400)
+        try:
+            post_channel_id = int(post_channel_id)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid_channel"}, status=400)
+        fields = _extract_ticket_fields(body)
+        error = await send_ticket_panel(int(guild_id), panel_id, fields, post_channel_id)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_tickets(int(guild_id)))
 
     async def api_add_leveling_noxp(request: web.Request) -> web.Response:
         guild_id = request.match_info["guild_id"]
@@ -681,6 +769,10 @@ def build_dashboard_routes(
     app.router.add_delete("/api/guilds/{guild_id}/leveling/role-reward/{level}", api_remove_leveling_role_reward)
     app.router.add_get("/api/guilds/{guild_id}/channels", api_guild_channels)
     app.router.add_get("/api/guilds/{guild_id}/roles", api_guild_roles)
+    app.router.add_get("/api/guilds/{guild_id}/categories", api_guild_categories)
+    app.router.add_get("/api/guilds/{guild_id}/tickets", api_get_tickets)
+    app.router.add_post("/api/guilds/{guild_id}/tickets", api_post_ticket_panel)
+    app.router.add_patch("/api/guilds/{guild_id}/tickets/{panel_id}", api_patch_ticket_panel)
     app.router.add_get("/api/guilds/{guild_id}/antinuke", api_get_antinuke)
     app.router.add_patch("/api/guilds/{guild_id}/antinuke", api_patch_antinuke)
     app.router.add_post("/api/guilds/{guild_id}/antinuke/whitelist", api_add_antinuke_whitelist)
@@ -1238,6 +1330,7 @@ async function buildCustomizationCard(me) {
 
 function badgeHtml(enabled) {
   if (enabled === null) return `<span class="status-badge" data-badge style="background:rgba(245,166,35,0.15);color:var(--gold);">Always Active</span>`;
+  if (typeof enabled === 'string') return `<span class="status-badge" data-badge style="background:var(--surface-2);color:var(--muted);">${enabled}</span>`;
   return `<span class="status-badge ${enabled ? 'on' : 'off'}" data-badge>${enabled ? 'Enabled' : 'Disabled'}</span>`;
 }
 
@@ -1265,12 +1358,14 @@ function setBadge(card, enabled) {
 
 async function renderGuildEditor(guildId) {
   app.innerHTML = '<div class="loading">Loading server settings…</div>';
-  const [lvlRes, chRes, rolesRes, anRes, asRes] = await Promise.all([
+  const [lvlRes, chRes, rolesRes, catRes, anRes, asRes, tixRes] = await Promise.all([
     api(`/api/guilds/${guildId}/leveling`),
     api(`/api/guilds/${guildId}/channels`),
     api(`/api/guilds/${guildId}/roles`),
+    api(`/api/guilds/${guildId}/categories`),
     api(`/api/guilds/${guildId}/antinuke`),
     api(`/api/guilds/${guildId}/antispam`),
+    api(`/api/guilds/${guildId}/tickets`),
   ]);
   if (lvlRes.status === 403 || lvlRes.status === 404) {
     app.innerHTML = `<div class="loading">You don't have access to manage this server.</div>`;
@@ -1279,12 +1374,14 @@ async function renderGuildEditor(guildId) {
   const lvl = await lvlRes.json();
   const channels = await chRes.json();
   const roles = await rolesRes.json();
+  const categories = await catRes.json();
   const an = await anRes.json();
   const as_ = await asRes.json();
+  const tix = await tixRes.json();
 
   app.innerHTML = '';
   app.appendChild(el(`<a href="/dashboard" class="back-link">&larr; All Servers</a>`));
-  app.appendChild(el(`<h1 class="page-title">Server Settings</h1><p class="page-sub">Click a system below to open its settings. More systems (Moderation, Tickets, Verification...) are on the way.</p>`));
+  app.appendChild(el(`<h1 class="page-title">Server Settings</h1><p class="page-sub">Click a system below to open its settings. More systems (Moderation, Verification...) are on the way.</p>`));
 
   // ---------------- Level & XP ----------------
   const roleOptions = (selectedId) => roles.map(r => `<option value="${r.id}" ${selectedId === r.id ? 'selected' : ''}>@${r.name}</option>`).join('');
@@ -1674,10 +1771,224 @@ async function renderGuildEditor(guildId) {
     else { status.textContent = data.error || 'Failed to save — try again.'; status.className = 'save-status err'; }
   };
 
+  // ---------------- Ticket System ----------------
+  const catOptions = (selectedId) => categories.map(c => `<option value="${c.id}" ${selectedId === c.id ? 'selected' : ''}>${c.name}</option>`).join('');
+  const chOptions = (selectedId) => channels.map(c => `<option value="${c.id}" ${selectedId === c.id ? 'selected' : ''}>#${c.name}</option>`).join('');
+  const BUTTON_STYLE_OPTS = [['danger','Red'],['primary','Blurple'],['secondary','Gray'],['success','Green']];
+  const styleOptions = (sel) => BUTTON_STYLE_OPTS.map(([v,l]) => `<option value="${v}" ${sel === v ? 'selected' : ''}>${l}</option>`).join('');
+
+  function ticketFieldsHtml(cls, p) {
+    p = p || { title:'Support Tickets', description:'Click the button below to open a support ticket.', welcome_message:'', category_id:null, log_channel_id:null, support_role_id:null, max_tickets:1, thumbnail:'', image:'', color:'8B0000', button_label:'Open Ticket', button_emoji:'', button_style:'danger', open_type:'button' };
+    return `
+      <div class="field">
+        <label>Panel Title</label>
+        <input type="text" class="${cls}Title" value="${p.title}">
+      </div>
+      <div class="field">
+        <label>Panel Description</label>
+        <textarea class="${cls}Desc" rows="2">${p.description}</textarea>
+      </div>
+      <div class="field">
+        <label>Welcome Message (sent inside a new ticket)</label>
+        <textarea class="${cls}Welcome" rows="2">${p.welcome_message}</textarea>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Ticket Category</label>
+          <select class="${cls}Category"><option value="">— None —</option>${catOptions(p.category_id)}</select>
+        </div>
+        <div class="field"><label>Log Channel</label>
+          <select class="${cls}Log"><option value="">— None —</option>${chOptions(p.log_channel_id)}</select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Support Role</label>
+          <select class="${cls}Role"><option value="">— None —</option>${roleOptions(p.support_role_id)}</select>
+        </div>
+        <div class="field"><label>Max Open Tickets / User (1–5)</label>
+          <input type="number" class="${cls}Max" min="1" max="5" value="${p.max_tickets}">
+        </div>
+      </div>
+      <div class="custom-subhead" style="margin-top:8px;font-size:13.5px;">Appearance</div>
+      <div class="field-row">
+        <div class="field"><label>Thumbnail URL</label>
+          <input type="url" class="${cls}Thumb" placeholder="https://example.com/icon.png" value="${p.thumbnail}">
+        </div>
+        <div class="field"><label>Banner URL</label>
+          <input type="url" class="${cls}Banner" placeholder="https://example.com/banner.png" value="${p.image}">
+        </div>
+      </div>
+      <div class="field">
+        <label>Embed Color</label>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <input type="color" class="${cls}ColorPick" value="#${p.color}" style="width:40px;height:40px;border:none;border-radius:8px;padding:0;background:none;cursor:pointer;">
+          <input type="text" class="${cls}Color" value="${p.color}" maxlength="7" style="flex:1;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'JetBrains Mono',monospace;font-size:13px;">
+        </div>
+      </div>
+      <div class="custom-subhead" style="margin-top:8px;font-size:13.5px;">Open Control</div>
+      <div class="field-row">
+        <div class="field"><label>Open Type</label>
+          <select class="${cls}OpenType">
+            <option value="button" ${p.open_type === 'button' ? 'selected' : ''}>Button</option>
+            <option value="dropdown" ${p.open_type === 'dropdown' ? 'selected' : ''}>Dropdown</option>
+          </select>
+        </div>
+        <div class="field"><label>Button Style</label>
+          <select class="${cls}Style">${styleOptions(p.button_style)}</select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Button Label</label>
+          <input type="text" class="${cls}Label" maxlength="80" value="${p.button_label}">
+        </div>
+        <div class="field"><label>Button Emoji (optional)</label>
+          <input type="text" class="${cls}Emoji" placeholder="🎫" value="${p.button_emoji}">
+        </div>
+      </div>
+    `;
+  }
+
+  function bindTicketFields(scope, cls) {
+    const colorPick = scope.querySelector(`.${cls}ColorPick`);
+    const colorText = scope.querySelector(`.${cls}Color`);
+    colorPick.oninput = () => { colorText.value = colorPick.value.replace('#','').toUpperCase(); };
+    colorText.oninput = () => { const v = colorText.value.replace('#','').trim(); if (/^[0-9A-Fa-f]{6}$/.test(v)) colorPick.value = '#' + v; };
+    return {
+      title: () => scope.querySelector(`.${cls}Title`).value,
+      description: () => scope.querySelector(`.${cls}Desc`).value,
+      welcome_message: () => scope.querySelector(`.${cls}Welcome`).value,
+      category_id: () => scope.querySelector(`.${cls}Category`).value || null,
+      log_channel_id: () => scope.querySelector(`.${cls}Log`).value || null,
+      support_role_id: () => scope.querySelector(`.${cls}Role`).value || null,
+      max_tickets: () => parseInt(scope.querySelector(`.${cls}Max`).value, 10),
+      thumbnail: () => scope.querySelector(`.${cls}Thumb`).value,
+      image: () => scope.querySelector(`.${cls}Banner`).value,
+      color: () => scope.querySelector(`.${cls}Color`).value,
+      open_type: () => scope.querySelector(`.${cls}OpenType`).value,
+      button_style: () => scope.querySelector(`.${cls}Style`).value,
+      button_label: () => scope.querySelector(`.${cls}Label`).value,
+      button_emoji: () => scope.querySelector(`.${cls}Emoji`).value,
+    };
+  }
+
+  const tixBadge = tix.panels.length ? `${tix.panels.length} panel${tix.panels.length === 1 ? '' : 's'}` : 'No panels yet';
+
+  const existingHtml = tix.panels.map((p, idx) => `
+    <div class="ticket-panel-block" data-panel="${p.id}" style="${idx > 0 ? 'margin-top:34px;' : 'margin-top:6px;'}border-top:1px solid var(--line);padding-top:26px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap;">
+        <span class="mono" style="font-size:13px;color:var(--gold);">${p.id}</span>
+        ${p.is_live ? `<span class="status-badge on" style="font-size:10px;">Live${p.post_channel_name ? ' in #' + p.post_channel_name : ''}</span>` : `<span class="status-badge off" style="font-size:10px;">Not posted</span>`}
+        ${p.types_count ? `<span class="soon-note" style="margin:0;">${p.types_count} ticket type${p.types_count === 1 ? '' : 's'} via /tickettype</span>` : ''}
+      </div>
+      ${ticketFieldsHtml('ex' + idx, p)}
+      <div class="save-row">
+        <button class="btn btn-primary exSave" data-idx="${idx}">Save Settings</button>
+        <span class="save-status exStatus" data-idx="${idx}"></span>
+      </div>
+      <div class="custom-subhead" style="margin-top:24px;font-size:13.5px;">Post / Move This Panel</div>
+      <div class="custom-subnote">Sends this panel's current message to the channel below — updates it in place if it's still there, otherwise posts a fresh one.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <select class="exPostChannel" data-idx="${idx}" style="flex:1;min-width:180px;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'Outfit',sans-serif;font-size:14px;">
+          <option value="">— Pick a channel —</option>${chOptions(p.post_channel_id)}
+        </select>
+        <button class="btn btn-gold exPost" data-idx="${idx}">Post to Channel</button>
+      </div>
+      <span class="save-status exPostStatus" data-idx="${idx}"></span>
+    </div>
+  `).join('');
+
+  const newPanelHtml = `
+    <div style="${tix.panels.length ? 'margin-top:34px;border-top:1px solid var(--line);padding-top:26px;' : 'margin-top:6px;'}">
+      <div class="custom-subhead" style="margin-top:0;">+ Create a New Panel</div>
+      <div class="custom-subnote">Give it a short ID (e.g. <span class="mono">support</span>), configure how it looks, pick a channel, and post it.</div>
+      <div class="field">
+        <label>Panel ID</label>
+        <input type="text" id="newPanelId" placeholder="support" maxlength="32">
+      </div>
+      ${ticketFieldsHtml('new', null)}
+      <div class="field">
+        <label>Post In Channel</label>
+        <select id="newPostChannel"><option value="">— Pick a channel —</option>${chOptions(null)}</select>
+      </div>
+      <div class="save-row">
+        <button class="btn btn-gold" id="newPost">Create &amp; Post Panel</button>
+        <span class="save-status" id="newPostStatus"></span>
+      </div>
+    </div>
+  `;
+
+  const tixBody = (tix.panels.length ? existingHtml : `<div class="soon-note">No ticket panels yet — create one below.</div>`) + newPanelHtml;
+
+  const tixCard = makeSysCard('<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M4 10h16"/></svg>', 'Ticket System', 'Support panels, categories, staff roles', tixBadge, tixBody);
+  app.appendChild(tixCard);
+
+  tixCard.querySelectorAll('.ticket-panel-block').forEach((block, idx) => {
+    const panelId = block.getAttribute('data-panel');
+    const f = bindTicketFields(block, 'ex' + idx);
+
+    block.querySelector('.exSave').onclick = async (e) => {
+      e.stopPropagation();
+      const status = block.querySelector('.exStatus');
+      status.textContent = 'Saving...'; status.className = 'save-status exStatus';
+      const body = {
+        title: f.title(), description: f.description(), welcome_message: f.welcome_message(),
+        category_id: f.category_id(), log_channel_id: f.log_channel_id(), support_role_id: f.support_role_id(),
+        max_tickets: f.max_tickets(), thumbnail: f.thumbnail(), image: f.image(), color: f.color(),
+        open_type: f.open_type(), button_style: f.button_style(), button_label: f.button_label(), button_emoji: f.button_emoji(),
+      };
+      const res = await api(`/api/guilds/${guildId}/tickets/${panelId}`, { method: 'PATCH', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (res.ok) { status.textContent = 'Saved — live panel message updated too.'; status.className = 'save-status exStatus ok'; }
+      else { status.textContent = data.error || 'Failed to save — try again.'; status.className = 'save-status exStatus err'; }
+    };
+
+    block.querySelector('.exPost').onclick = async (e) => {
+      e.stopPropagation();
+      const status = block.querySelector('.exPostStatus');
+      const channelSel = block.querySelector('.exPostChannel');
+      if (!channelSel.value) { status.textContent = 'Pick a channel first.'; status.className = 'save-status exPostStatus err'; return; }
+      status.textContent = 'Posting...'; status.className = 'save-status exPostStatus';
+      const body = {
+        panel_id: panelId, post_channel_id: channelSel.value,
+        title: f.title(), description: f.description(), welcome_message: f.welcome_message(),
+        category_id: f.category_id(), log_channel_id: f.log_channel_id(), support_role_id: f.support_role_id(),
+        max_tickets: f.max_tickets(), thumbnail: f.thumbnail(), image: f.image(), color: f.color(),
+        open_type: f.open_type(), button_style: f.button_style(), button_label: f.button_label(), button_emoji: f.button_emoji(),
+      };
+      const res = await api(`/api/guilds/${guildId}/tickets`, { method: 'POST', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (res.ok) { status.textContent = 'Posted.'; status.className = 'save-status exPostStatus ok'; setTimeout(() => renderGuildEditor(guildId), 700); }
+      else { status.textContent = data.error || 'Failed to post — try again.'; status.className = 'save-status exPostStatus err'; }
+    };
+  });
+
+  (function bindNewPanel() {
+    const f = bindTicketFields(tixCard, 'new');
+    tixCard.querySelector('#newPost').onclick = async (e) => {
+      e.stopPropagation();
+      const status = tixCard.querySelector('#newPostStatus');
+      const idInput = tixCard.querySelector('#newPanelId');
+      const channelSel = tixCard.querySelector('#newPostChannel');
+      if (!idInput.value.trim()) { status.textContent = 'Give the panel an ID.'; status.className = 'save-status err'; return; }
+      if (!channelSel.value) { status.textContent = 'Pick a channel to post in.'; status.className = 'save-status err'; return; }
+      status.textContent = 'Posting...'; status.className = 'save-status';
+      const body = {
+        panel_id: idInput.value.trim(), post_channel_id: channelSel.value,
+        title: f.title(), description: f.description(), welcome_message: f.welcome_message(),
+        category_id: f.category_id(), log_channel_id: f.log_channel_id(), support_role_id: f.support_role_id(),
+        max_tickets: f.max_tickets(), thumbnail: f.thumbnail(), image: f.image(), color: f.color(),
+        open_type: f.open_type(), button_style: f.button_style(), button_label: f.button_label(), button_emoji: f.button_emoji(),
+      };
+      const res = await api(`/api/guilds/${guildId}/tickets`, { method: 'POST', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (res.ok) { status.textContent = 'Posted! Reloading...'; status.className = 'save-status ok'; setTimeout(() => renderGuildEditor(guildId), 700); }
+      else { status.textContent = data.error || 'Failed to post — try again.'; status.className = 'save-status err'; }
+    };
+  })();
+
   // ---------------- Coming soon ----------------
   app.appendChild(el(`
     <div class="panel" style="opacity:0.5;">
-      <div class="panel-head"><h2>Moderation, Tickets, Verification &amp; more</h2></div>
+      <div class="panel-head"><h2>Moderation, Verification &amp; more</h2></div>
       <div class="soon-note">Coming in a future update — for now, configure these with commands in Discord.</div>
     </div>
   `));
