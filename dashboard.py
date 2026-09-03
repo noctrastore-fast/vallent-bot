@@ -981,6 +981,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   .custom-divider{ height:1px; background:var(--line); margin:34px 0 6px; }
 
+  /* ---------- Ticket System: tabs + live preview ---------- */
+  .tix-tabs{ display:flex; gap:4px; flex-wrap:wrap; margin-bottom:26px; border-bottom:1px solid var(--line); }
+  .tix-tab{ background:transparent; border:none; border-bottom:2px solid transparent; color:var(--muted); font-size:13px; font-weight:600;
+    padding:11px 14px; cursor:pointer; display:flex; align-items:center; gap:7px; transition:color .2s ease, border-color .2s ease; white-space:nowrap; }
+  .tix-tab:hover{ color:var(--ink); }
+  .tix-tab.active{ color:var(--ink); border-bottom-color:var(--gold); }
+  .tix-tab-new{ color:var(--gold); }
+  .tix-tab-new.active{ border-bottom-color:var(--gold); }
+  .tix-dot{ width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+  .tix-dot.on{ background:#4ade80; }
+  .tix-dot.off{ background:var(--muted-2); }
+
+  .tix-pane{ display:none; }
+  .tix-pane.active{ display:block; }
+  .tix-layout{ display:grid; grid-template-columns:260px 1fr; gap:28px; align-items:start; }
+  @media (max-width:760px){ .tix-layout{ grid-template-columns:1fr; } }
+
+  .tix-preview{ position:sticky; top:20px; border-radius:10px; overflow:hidden; background:var(--surface-2); border:1px solid var(--line); box-shadow:var(--shadow-sm); }
+  .tix-preview-banner{ height:76px; background:linear-gradient(120deg,var(--crimson-deep),var(--crimson)); background-size:cover; background-position:center; }
+  .tix-preview-body{ padding:16px; border-left:3px solid #8B0000; }
+  .tix-preview-head{ display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .tix-preview-thumb{ width:32px; height:32px; border-radius:7px; object-fit:cover; flex-shrink:0; background:var(--surface-3); }
+  .tix-preview-title{ font-size:14px; font-weight:700; line-height:1.3; }
+  .tix-preview-desc{ font-size:12px; color:var(--muted); line-height:1.55; margin-bottom:14px; white-space:pre-wrap; word-break:break-word; }
+  .tix-preview-btn{ display:inline-flex; align-items:center; gap:6px; padding:8px 14px; border-radius:5px; font-size:12.5px; font-weight:600; color:#fff; }
+  .tix-preview-caption{ font-size:11px; color:var(--muted-2); text-align:center; padding:8px 0 2px; }
+
   /* ---------- Checkout ---------- */
   .checkout-panel{ max-width:520px; }
   .order-summary{ border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:24px; }
@@ -1775,6 +1802,7 @@ async function renderGuildEditor(guildId) {
   const catOptions = (selectedId) => categories.map(c => `<option value="${c.id}" ${selectedId === c.id ? 'selected' : ''}>${c.name}</option>`).join('');
   const chOptions = (selectedId) => channels.map(c => `<option value="${c.id}" ${selectedId === c.id ? 'selected' : ''}>#${c.name}</option>`).join('');
   const BUTTON_STYLE_OPTS = [['danger','Red'],['primary','Blurple'],['secondary','Gray'],['success','Green']];
+  const BUTTON_STYLE_COLORS = { danger:'#da373c', primary:'#5865f2', secondary:'#4e5058', success:'#248046' };
   const styleOptions = (sel) => BUTTON_STYLE_OPTS.map(([v,l]) => `<option value="${v}" ${sel === v ? 'selected' : ''}>${l}</option>`).join('');
 
   function ticketFieldsHtml(cls, p) {
@@ -1847,11 +1875,28 @@ async function renderGuildEditor(guildId) {
     `;
   }
 
+  function ticketPreviewHtml(cls) {
+    return `
+      <div class="tix-preview">
+        <div class="tix-preview-banner ${cls}PrevBanner"></div>
+        <div class="tix-preview-body ${cls}PrevBody">
+          <div class="tix-preview-head">
+            <img class="tix-preview-thumb ${cls}PrevThumb" style="display:none;">
+            <div class="tix-preview-title ${cls}PrevTitle">Support Tickets</div>
+          </div>
+          <div class="tix-preview-desc ${cls}PrevDesc">Click the button below to open a support ticket.</div>
+          <div class="tix-preview-btn ${cls}PrevBtn">🎫 Open Ticket</div>
+        </div>
+      </div>
+      <div class="tix-preview-caption">Live preview — updates as you type</div>
+    `;
+  }
+
   function bindTicketFields(scope, cls) {
     const colorPick = scope.querySelector(`.${cls}ColorPick`);
     const colorText = scope.querySelector(`.${cls}Color`);
-    colorPick.oninput = () => { colorText.value = colorPick.value.replace('#','').toUpperCase(); };
-    colorText.oninput = () => { const v = colorText.value.replace('#','').trim(); if (/^[0-9A-Fa-f]{6}$/.test(v)) colorPick.value = '#' + v; };
+    colorPick.oninput = () => { colorText.value = colorPick.value.replace('#','').toUpperCase(); colorText.dispatchEvent(new Event('input')); };
+    colorText.addEventListener('input', () => { const v = colorText.value.replace('#','').trim(); if (/^[0-9A-Fa-f]{6}$/.test(v)) colorPick.value = '#' + v; });
     return {
       title: () => scope.querySelector(`.${cls}Title`).value,
       description: () => scope.querySelector(`.${cls}Desc`).value,
@@ -1870,64 +1915,115 @@ async function renderGuildEditor(guildId) {
     };
   }
 
+  function wireTicketPreview(scope, cls, f) {
+    const banner = scope.querySelector(`.${cls}PrevBanner`);
+    const body   = scope.querySelector(`.${cls}PrevBody`);
+    const thumb  = scope.querySelector(`.${cls}PrevThumb`);
+    const title  = scope.querySelector(`.${cls}PrevTitle`);
+    const desc   = scope.querySelector(`.${cls}PrevDesc`);
+    const btn    = scope.querySelector(`.${cls}PrevBtn`);
+    function refresh() {
+      title.textContent = f.title() || 'Support Tickets';
+      desc.textContent = f.description() || 'Click the button below to open a support ticket.';
+      const thumbUrl = f.thumbnail();
+      if (thumbUrl) { thumb.src = thumbUrl; thumb.style.display = ''; thumb.onerror = () => { thumb.style.display = 'none'; }; }
+      else { thumb.style.display = 'none'; }
+      const bannerUrl = f.image();
+      banner.style.backgroundImage = bannerUrl ? `url('${bannerUrl}')` : '';
+      const color = '#' + (f.color() || '8B0000').replace('#','');
+      body.style.borderLeftColor = /^#[0-9A-Fa-f]{6}$/.test(color) ? color : '#8B0000';
+      btn.style.background = BUTTON_STYLE_COLORS[f.button_style()] || BUTTON_STYLE_COLORS.danger;
+      btn.textContent = (f.button_emoji() ? f.button_emoji() + ' ' : '') + (f.button_label() || 'Open Ticket');
+    }
+    scope.querySelectorAll(`.${cls}Title, .${cls}Desc, .${cls}Thumb, .${cls}Banner, .${cls}Color, .${cls}Style, .${cls}Label, .${cls}Emoji`).forEach(inp => {
+      inp.addEventListener('input', refresh);
+    });
+    refresh();
+  }
+
   const tixBadge = tix.panels.length ? `${tix.panels.length} panel${tix.panels.length === 1 ? '' : 's'}` : 'No panels yet';
 
-  const existingHtml = tix.panels.map((p, idx) => `
-    <div class="ticket-panel-block" data-panel="${p.id}" style="${idx > 0 ? 'margin-top:34px;' : 'margin-top:6px;'}border-top:1px solid var(--line);padding-top:26px;">
+  const tabsHtml = `<div class="tix-tabs">` +
+    tix.panels.map((p, idx) => `<button class="tix-tab" data-tab="ex${idx}"><span class="tix-dot ${p.is_live ? 'on' : 'off'}"></span>${p.id}</button>`).join('') +
+    `<button class="tix-tab tix-tab-new" data-tab="new">+ New Panel</button></div>`;
+
+  const existingPanes = tix.panels.map((p, idx) => `
+    <div class="tix-pane" data-pane="ex${idx}">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap;">
         <span class="mono" style="font-size:13px;color:var(--gold);">${p.id}</span>
         ${p.is_live ? `<span class="status-badge on" style="font-size:10px;">Live${p.post_channel_name ? ' in #' + p.post_channel_name : ''}</span>` : `<span class="status-badge off" style="font-size:10px;">Not posted</span>`}
         ${p.types_count ? `<span class="soon-note" style="margin:0;">${p.types_count} ticket type${p.types_count === 1 ? '' : 's'} via /tickettype</span>` : ''}
       </div>
-      ${ticketFieldsHtml('ex' + idx, p)}
-      <div class="save-row">
-        <button class="btn btn-primary exSave" data-idx="${idx}">Save Settings</button>
-        <span class="save-status exStatus" data-idx="${idx}"></span>
+      <div class="tix-layout">
+        <div>${ticketPreviewHtml('ex' + idx)}</div>
+        <div>
+          ${ticketFieldsHtml('ex' + idx, p)}
+          <div class="save-row">
+            <button class="btn btn-primary exSave" data-idx="${idx}">Save Settings</button>
+            <span class="save-status exStatus" data-idx="${idx}"></span>
+          </div>
+          <div class="custom-subhead" style="margin-top:24px;font-size:13.5px;">Post / Move This Panel</div>
+          <div class="custom-subnote">Sends this panel's current message to the channel below — updates it in place if it's still there, otherwise posts a fresh one.</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <select class="exPostChannel" data-idx="${idx}" style="flex:1;min-width:180px;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'Outfit',sans-serif;font-size:14px;">
+              <option value="">— Pick a channel —</option>${chOptions(p.post_channel_id)}
+            </select>
+            <button class="btn btn-gold exPost" data-idx="${idx}">Post to Channel</button>
+          </div>
+          <span class="save-status exPostStatus" data-idx="${idx}"></span>
+        </div>
       </div>
-      <div class="custom-subhead" style="margin-top:24px;font-size:13.5px;">Post / Move This Panel</div>
-      <div class="custom-subnote">Sends this panel's current message to the channel below — updates it in place if it's still there, otherwise posts a fresh one.</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-        <select class="exPostChannel" data-idx="${idx}" style="flex:1;min-width:180px;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'Outfit',sans-serif;font-size:14px;">
-          <option value="">— Pick a channel —</option>${chOptions(p.post_channel_id)}
-        </select>
-        <button class="btn btn-gold exPost" data-idx="${idx}">Post to Channel</button>
-      </div>
-      <span class="save-status exPostStatus" data-idx="${idx}"></span>
     </div>
   `).join('');
 
-  const newPanelHtml = `
-    <div style="${tix.panels.length ? 'margin-top:34px;border-top:1px solid var(--line);padding-top:26px;' : 'margin-top:6px;'}">
-      <div class="custom-subhead" style="margin-top:0;">+ Create a New Panel</div>
-      <div class="custom-subnote">Give it a short ID (e.g. <span class="mono">support</span>), configure how it looks, pick a channel, and post it.</div>
-      <div class="field">
-        <label>Panel ID</label>
-        <input type="text" id="newPanelId" placeholder="support" maxlength="32">
-      </div>
-      ${ticketFieldsHtml('new', null)}
-      <div class="field">
-        <label>Post In Channel</label>
-        <select id="newPostChannel"><option value="">— Pick a channel —</option>${chOptions(null)}</select>
-      </div>
-      <div class="save-row">
-        <button class="btn btn-gold" id="newPost">Create &amp; Post Panel</button>
-        <span class="save-status" id="newPostStatus"></span>
+  const newPane = `
+    <div class="tix-pane" data-pane="new">
+      <div class="custom-subnote" style="margin-bottom:18px;">Give it a short ID (e.g. <span class="mono">support</span>), configure how it looks, pick a channel, and post it.</div>
+      <div class="tix-layout">
+        <div>${ticketPreviewHtml('new')}</div>
+        <div>
+          <div class="field">
+            <label>Panel ID</label>
+            <input type="text" id="newPanelId" placeholder="support" maxlength="32">
+          </div>
+          ${ticketFieldsHtml('new', null)}
+          <div class="field">
+            <label>Post In Channel</label>
+            <select id="newPostChannel"><option value="">— Pick a channel —</option>${chOptions(null)}</select>
+          </div>
+          <div class="save-row">
+            <button class="btn btn-gold" id="newPost">Create &amp; Post Panel</button>
+            <span class="save-status" id="newPostStatus"></span>
+          </div>
+        </div>
       </div>
     </div>
   `;
 
-  const tixBody = (tix.panels.length ? existingHtml : `<div class="soon-note">No ticket panels yet — create one below.</div>`) + newPanelHtml;
+  const tixBody = tabsHtml + `<div class="tix-panes">` + existingPanes + newPane + `</div>`;
 
   const tixCard = makeSysCard('<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M4 10h16"/></svg>', 'Ticket System', 'Support panels, categories, staff roles', tixBadge, tixBody);
   app.appendChild(tixCard);
 
-  tixCard.querySelectorAll('.ticket-panel-block').forEach((block, idx) => {
-    const panelId = block.getAttribute('data-panel');
-    const f = bindTicketFields(block, 'ex' + idx);
+  // ---- tab switching ----
+  const tixTabBtns = tixCard.querySelectorAll('.tix-tab');
+  const tixPanes = tixCard.querySelectorAll('.tix-pane');
+  function showTixTab(name) {
+    tixTabBtns.forEach(b => b.classList.toggle('active', b.getAttribute('data-tab') === name));
+    tixPanes.forEach(p => p.classList.toggle('active', p.getAttribute('data-pane') === name));
+  }
+  tixTabBtns.forEach(b => { b.onclick = (e) => { e.stopPropagation(); showTixTab(b.getAttribute('data-tab')); }; });
+  showTixTab(tix.panels.length ? 'ex0' : 'new');
 
-    block.querySelector('.exSave').onclick = async (e) => {
+  // ---- existing panels: fields, preview, save, post ----
+  tixCard.querySelectorAll('[data-pane^="ex"]').forEach((pane, idx) => {
+    const panelId = tix.panels[idx].id;
+    const f = bindTicketFields(pane, 'ex' + idx);
+    wireTicketPreview(pane, 'ex' + idx, f);
+
+    pane.querySelector('.exSave').onclick = async (e) => {
       e.stopPropagation();
-      const status = block.querySelector('.exStatus');
+      const status = pane.querySelector('.exStatus');
       status.textContent = 'Saving...'; status.className = 'save-status exStatus';
       const body = {
         title: f.title(), description: f.description(), welcome_message: f.welcome_message(),
@@ -1941,10 +2037,10 @@ async function renderGuildEditor(guildId) {
       else { status.textContent = data.error || 'Failed to save — try again.'; status.className = 'save-status exStatus err'; }
     };
 
-    block.querySelector('.exPost').onclick = async (e) => {
+    pane.querySelector('.exPost').onclick = async (e) => {
       e.stopPropagation();
-      const status = block.querySelector('.exPostStatus');
-      const channelSel = block.querySelector('.exPostChannel');
+      const status = pane.querySelector('.exPostStatus');
+      const channelSel = pane.querySelector('.exPostChannel');
       if (!channelSel.value) { status.textContent = 'Pick a channel first.'; status.className = 'save-status exPostStatus err'; return; }
       status.textContent = 'Posting...'; status.className = 'save-status exPostStatus';
       const body = {
@@ -1961,13 +2057,16 @@ async function renderGuildEditor(guildId) {
     };
   });
 
+  // ---- new panel: fields, preview, create ----
   (function bindNewPanel() {
-    const f = bindTicketFields(tixCard, 'new');
-    tixCard.querySelector('#newPost').onclick = async (e) => {
+    const newPaneEl = tixCard.querySelector('[data-pane="new"]');
+    const f = bindTicketFields(newPaneEl, 'new');
+    wireTicketPreview(newPaneEl, 'new', f);
+    newPaneEl.querySelector('#newPost').onclick = async (e) => {
       e.stopPropagation();
-      const status = tixCard.querySelector('#newPostStatus');
-      const idInput = tixCard.querySelector('#newPanelId');
-      const channelSel = tixCard.querySelector('#newPostChannel');
+      const status = newPaneEl.querySelector('#newPostStatus');
+      const idInput = newPaneEl.querySelector('#newPanelId');
+      const channelSel = newPaneEl.querySelector('#newPostChannel');
       if (!idInput.value.trim()) { status.textContent = 'Give the panel an ID.'; status.className = 'save-status err'; return; }
       if (!channelSel.value) { status.textContent = 'Pick a channel to post in.'; status.className = 'save-status err'; return; }
       status.textContent = 'Posting...'; status.className = 'save-status';
