@@ -103,6 +103,11 @@ def build_dashboard_routes(
     get_tickets: Callable[[int], dict],
     set_ticket_panel: Callable[[int, str, dict], Optional[str]],
     send_ticket_panel: Callable[[int, str, dict, int], Awaitable[Optional[str]]],
+    get_components: Callable[[int], dict],
+    set_component: Callable[[int, str, dict], Optional[str]],
+    send_component: Callable[[int, str, dict, int], Awaitable[Optional[str]]],
+    add_component_button: Callable[[int, str, dict], Optional[str]],
+    remove_component_button: Callable[[int, str, int], Optional[str]],
     get_antinuke: Callable[[int], dict],
     set_antinuke: Callable[[int, dict], Optional[str]],
     add_antinuke_whitelist: Callable[[int, int], Optional[str]],
@@ -141,6 +146,23 @@ def build_dashboard_routes(
         mechanics as the /ticketpanel builder's own Send/Update step (edits the existing live message
         in place if it's still there, otherwise posts fresh in post_channel_id). Returns an error
         string or None.
+      - get_components(guild_id) -> {"components": [{"id","title","description","thumbnail","image",
+        "color","buttons":[{"index","kind","label","url","emoji","style","response_title",
+        "response_description","response_thumbnail","response_banner","description"}],"is_live",
+        "post_channel_id","post_channel_name"}], "max_buttons": int} — mirrors the `/component` builder
+        (a Container message with link and/or response buttons).
+      - set_component(guild_id, component_id, dict) -> settings-only update (title/description/
+        thumbnail/image/color) on a message that already exists; refreshes the live message in place
+        if there is one. Returns an error string or None.
+      - send_component(guild_id, component_id, dict, post_channel_id) -> ASYNC (await this one).
+        Same create-or-move mechanics as send_ticket_panel, for a message component instead of a
+        ticket panel.
+      - add_component_button(guild_id, component_id, dict) -> dict needs "kind": "link" (+ label, url,
+        emoji) or "kind": "response" (+ label, response_title, response_description, emoji, style,
+        response_thumbnail, response_banner). Appends one button; returns an error string or None, and
+        refreshes the live message if there is one.
+      - remove_component_button(guild_id, component_id, index) -> removes one button by its index;
+        returns an error string or None, and refreshes the live message if there is one.
       - get_antinuke(guild_id)       -> {"enabled", "log_channel", "punishment", "whitelist": [...], "bot_has_audit_log_perm"}
       - set_antinuke(guild_id, dict) -> applies + persists a partial update; returns an error string or None
       - add/remove_antinuke_whitelist(guild_id, user_id) -> mutate the whitelist by one user
@@ -426,6 +448,103 @@ def build_dashboard_routes(
         if error:
             return web.json_response({"error": error}, status=400)
         return web.json_response(get_tickets(int(guild_id)))
+
+    async def api_get_components(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        return web.json_response(get_components(int(guild_id)))
+
+    def _extract_component_fields(body: dict) -> dict:
+        fields = {}
+        for key in ("title", "description", "thumbnail", "image", "color"):
+            if key in body:
+                fields[key] = str(body[key]) if body[key] is not None else ""
+        return fields
+
+    async def api_patch_component(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        component_id = request.match_info["component_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        update = _extract_component_fields(body)
+        error = set_component(int(guild_id), component_id, update)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_components(int(guild_id)))
+
+    async def api_post_component(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        component_id = str(body.get("component_id", "")).strip()
+        post_channel_id = body.get("post_channel_id")
+        if not component_id or not post_channel_id:
+            return web.json_response({"error": "Pick a message ID and a channel to post in."}, status=400)
+        try:
+            post_channel_id = int(post_channel_id)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid_channel"}, status=400)
+        fields = _extract_component_fields(body)
+        error = await send_component(int(guild_id), component_id, fields, post_channel_id)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_components(int(guild_id)))
+
+    async def api_add_component_button(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        component_id = request.match_info["component_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        kind = str(body.get("kind", "")).strip()
+        button_fields = {"kind": kind}
+        for key in ("label", "url", "emoji", "style", "response_title", "response_description", "response_thumbnail", "response_banner"):
+            if key in body:
+                button_fields[key] = str(body[key]) if body[key] is not None else ""
+        error = add_component_button(int(guild_id), component_id, button_fields)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_components(int(guild_id)))
+
+    async def api_remove_component_button(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        component_id = request.match_info["component_id"]
+        index = request.match_info["index"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        if request.headers.get("X-Requested-With") != "vallent-dashboard":
+            return web.json_response({"error": "bad_request"}, status=400)
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "invalid_index"}, status=400)
+        error = remove_component_button(int(guild_id), component_id, index)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        return web.json_response(get_components(int(guild_id)))
 
     async def api_add_leveling_noxp(request: web.Request) -> web.Response:
         guild_id = request.match_info["guild_id"]
@@ -773,6 +892,11 @@ def build_dashboard_routes(
     app.router.add_get("/api/guilds/{guild_id}/tickets", api_get_tickets)
     app.router.add_post("/api/guilds/{guild_id}/tickets", api_post_ticket_panel)
     app.router.add_patch("/api/guilds/{guild_id}/tickets/{panel_id}", api_patch_ticket_panel)
+    app.router.add_get("/api/guilds/{guild_id}/components", api_get_components)
+    app.router.add_post("/api/guilds/{guild_id}/components", api_post_component)
+    app.router.add_patch("/api/guilds/{guild_id}/components/{component_id}", api_patch_component)
+    app.router.add_post("/api/guilds/{guild_id}/components/{component_id}/buttons", api_add_component_button)
+    app.router.add_delete("/api/guilds/{guild_id}/components/{component_id}/buttons/{index}", api_remove_component_button)
     app.router.add_get("/api/guilds/{guild_id}/antinuke", api_get_antinuke)
     app.router.add_patch("/api/guilds/{guild_id}/antinuke", api_patch_antinuke)
     app.router.add_post("/api/guilds/{guild_id}/antinuke/whitelist", api_add_antinuke_whitelist)
@@ -1432,7 +1556,7 @@ function setBadge(card, enabled) {
 
 async function renderGuildEditor(guildId, me) {
   app.innerHTML = '<div class="loading">Loading server settings…</div>';
-  const [lvlRes, chRes, rolesRes, catRes, anRes, asRes, tixRes] = await Promise.all([
+  const [lvlRes, chRes, rolesRes, catRes, anRes, asRes, tixRes, compRes] = await Promise.all([
     api(`/api/guilds/${guildId}/leveling`),
     api(`/api/guilds/${guildId}/channels`),
     api(`/api/guilds/${guildId}/roles`),
@@ -1440,6 +1564,7 @@ async function renderGuildEditor(guildId, me) {
     api(`/api/guilds/${guildId}/antinuke`),
     api(`/api/guilds/${guildId}/antispam`),
     api(`/api/guilds/${guildId}/tickets`),
+    api(`/api/guilds/${guildId}/components`),
   ]);
   if (lvlRes.status === 403 || lvlRes.status === 404) {
     app.innerHTML = `<div class="loading">You don't have access to manage this server.</div>`;
@@ -1452,6 +1577,7 @@ async function renderGuildEditor(guildId, me) {
   const an = await anRes.json();
   const as_ = await asRes.json();
   const tix = await tixRes.json();
+  const comps = await compRes.json();
   const guildMeta = (me && me.guilds || []).find(g => g.id === guildId);
 
   app.innerHTML = '';
@@ -2177,11 +2303,350 @@ async function renderGuildEditor(guildId, me) {
     };
   })();
 
+  // ---------------- Message Components ----------------
+  const RESPONSE_STYLE_COLORS = { primary:'#5865f2', secondary:'#4e5058', success:'#248046', danger:'#da373c' };
+  const RESPONSE_STYLE_OPTS = [['secondary','Gray'],['primary','Blurple'],['success','Green'],['danger','Red']];
+  const responseStyleOptions = (sel) => RESPONSE_STYLE_OPTS.map(([v,l]) => `<option value="${v}" ${sel === v ? 'selected' : ''}>${l}</option>`).join('');
+
+  function componentFieldsHtml(cls, c) {
+    c = c || { title:'', description:'', thumbnail:'', image:'', color:'8B0000' };
+    return `
+      <div class="field">
+        <label>Title (optional)</label>
+        <input type="text" class="${cls}Title" maxlength="256" value="${c.title}">
+      </div>
+      <div class="field">
+        <label>Description</label>
+        <textarea class="${cls}Desc" rows="3">${c.description}</textarea>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Thumbnail URL</label>
+          <input type="url" class="${cls}Thumb" placeholder="https://example.com/icon.png" value="${c.thumbnail}">
+        </div>
+        <div class="field"><label>Banner URL</label>
+          <input type="url" class="${cls}Banner" placeholder="https://example.com/banner.png" value="${c.image}">
+        </div>
+      </div>
+      <div class="field">
+        <label>Accent Color</label>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <input type="color" class="${cls}ColorPick" value="#${c.color}" style="width:40px;height:40px;border:none;border-radius:8px;padding:0;background:none;cursor:pointer;">
+          <input type="text" class="${cls}Color" value="${c.color}" maxlength="7" style="flex:1;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'JetBrains Mono',monospace;font-size:13px;">
+        </div>
+      </div>
+    `;
+  }
+
+  function componentPreviewHtml(cls) {
+    return `
+      <div class="tix-preview">
+        <div class="tix-preview-banner ${cls}PrevBanner"></div>
+        <div class="tix-preview-body ${cls}PrevBody">
+          <div class="tix-preview-head">
+            <img class="tix-preview-thumb ${cls}PrevThumb" style="display:none;">
+            <div class="tix-preview-title ${cls}PrevTitle"></div>
+          </div>
+          <div class="tix-preview-desc ${cls}PrevDesc">Nothing set yet.</div>
+          <div class="${cls}PrevButtons" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+        </div>
+      </div>
+      <div class="tix-preview-caption">Live preview — updates as you type</div>
+    `;
+  }
+
+  function bindComponentFields(scope, cls) {
+    const colorPick = scope.querySelector(`.${cls}ColorPick`);
+    const colorText = scope.querySelector(`.${cls}Color`);
+    colorPick.oninput = () => { colorText.value = colorPick.value.replace('#','').toUpperCase(); colorText.dispatchEvent(new Event('input')); };
+    colorText.addEventListener('input', () => { const v = colorText.value.replace('#','').trim(); if (/^[0-9A-Fa-f]{6}$/.test(v)) colorPick.value = '#' + v; });
+    return {
+      title: () => scope.querySelector(`.${cls}Title`).value,
+      description: () => scope.querySelector(`.${cls}Desc`).value,
+      thumbnail: () => scope.querySelector(`.${cls}Thumb`).value,
+      image: () => scope.querySelector(`.${cls}Banner`).value,
+      color: () => scope.querySelector(`.${cls}Color`).value,
+    };
+  }
+
+  function componentButtonPreviewHtml(btn) {
+    if (btn.kind === 'link') {
+      return `<span style="display:inline-flex;align-items:center;gap:5px;padding:7px 12px;border-radius:5px;font-size:12px;font-weight:600;border:1px solid var(--line-2);color:var(--ink);">${btn.emoji ? btn.emoji + ' ' : ''}${btn.label} &#8599;</span>`;
+    }
+    const bg = RESPONSE_STYLE_COLORS[btn.style] || RESPONSE_STYLE_COLORS.secondary;
+    return `<span style="display:inline-flex;align-items:center;gap:5px;padding:7px 12px;border-radius:5px;font-size:12px;font-weight:600;color:#fff;background:${bg};">${btn.emoji ? btn.emoji + ' ' : ''}${btn.label}</span>`;
+  }
+
+  function wireComponentPreview(scope, cls, f, getButtons) {
+    const banner = scope.querySelector(`.${cls}PrevBanner`);
+    const body   = scope.querySelector(`.${cls}PrevBody`);
+    const thumb  = scope.querySelector(`.${cls}PrevThumb`);
+    const title  = scope.querySelector(`.${cls}PrevTitle`);
+    const desc   = scope.querySelector(`.${cls}PrevDesc`);
+    const btnsEl = scope.querySelector(`.${cls}PrevButtons`);
+    function refresh() {
+      const t = f.title();
+      title.textContent = t; title.style.display = t ? '' : 'none';
+      desc.textContent = f.description() || 'Nothing set yet.';
+      const thumbUrl = f.thumbnail();
+      if (thumbUrl) { thumb.src = thumbUrl; thumb.style.display = ''; thumb.onerror = () => { thumb.style.display = 'none'; }; }
+      else { thumb.style.display = 'none'; }
+      const bannerUrl = f.image();
+      banner.style.backgroundImage = bannerUrl ? `url('${bannerUrl}')` : '';
+      const color = '#' + (f.color() || '8B0000').replace('#','');
+      body.style.borderLeftColor = /^#[0-9A-Fa-f]{6}$/.test(color) ? color : '#8B0000';
+      const buttons = getButtons ? getButtons() : [];
+      btnsEl.innerHTML = buttons.length ? buttons.map(componentButtonPreviewHtml).join('') : '';
+    }
+    scope.querySelectorAll(`.${cls}Title, .${cls}Desc, .${cls}Thumb, .${cls}Banner, .${cls}Color`).forEach(inp => inp.addEventListener('input', refresh));
+    refresh();
+    return refresh;
+  }
+
+  function buttonManagerHtml(cls, buttons, maxButtons) {
+    const rows = buttons.map(b => `
+      <div style="display:flex;align-items:center;gap:10px;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:9px 12px;">
+        <span style="flex:1;font-size:12.5px;">${b.description}</span>
+        <button class="btnRemove" data-idx="${b.index}" style="background:transparent;border:none;color:var(--muted-2);cursor:pointer;font-size:16px;">&times;</button>
+      </div>
+    `).join('');
+    return `
+      <div class="${cls}ButtonSection">
+      <div class="custom-subhead" style="margin-top:8px;font-size:13.5px;">Buttons <span class="soon-note" style="margin:0;display:inline;">(${buttons.length}/${maxButtons})</span></div>
+      <div class="${cls}BtnList" style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">${rows || `<div class="soon-note">No buttons yet — add one below.</div>`}</div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <button type="button" class="${cls}KindBtn" data-kind="link" style="flex:1;">+ Link Button</button>
+        <button type="button" class="${cls}KindBtn" data-kind="response" style="flex:1;">+ Response Button</button>
+      </div>
+      <div class="${cls}LinkForm" style="display:none;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:12px;">
+        <div class="field-row">
+          <div class="field"><label>Label</label><input type="text" class="${cls}LinkLabel" maxlength="80" placeholder="Visit Website"></div>
+          <div class="field"><label>Emoji (optional)</label><input type="text" class="${cls}LinkEmoji" placeholder="🔗"></div>
+        </div>
+        <div class="field"><label>URL</label><input type="url" class="${cls}LinkUrl" placeholder="https://example.com"></div>
+        <button type="button" class="btn btn-primary btn-sm ${cls}LinkAdd">Add Link Button</button>
+        <span class="save-status ${cls}LinkStatus"></span>
+      </div>
+      <div class="${cls}RespForm" style="display:none;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:12px;">
+        <div class="field-row">
+          <div class="field"><label>Label</label><input type="text" class="${cls}RespLabel" maxlength="80" placeholder="More Info"></div>
+          <div class="field"><label>Emoji (optional)</label><input type="text" class="${cls}RespEmoji" placeholder="💬"></div>
+        </div>
+        <div class="field"><label>Button Style</label><select class="${cls}RespStyle">${responseStyleOptions('secondary')}</select></div>
+        <div class="field"><label>Response Title</label><input type="text" class="${cls}RespTitle" maxlength="256" placeholder="Shown when clicked"></div>
+        <div class="field"><label>Response Description</label><textarea class="${cls}RespDesc" rows="2"></textarea></div>
+        <div class="field-row">
+          <div class="field"><label>Response Thumbnail (optional)</label><input type="url" class="${cls}RespThumb"></div>
+          <div class="field"><label>Response Banner (optional)</label><input type="url" class="${cls}RespBanner"></div>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm ${cls}RespAdd">Add Response Button</button>
+        <span class="save-status ${cls}RespStatus"></span>
+      </div>
+      </div>
+    `;
+  }
+
+  function bindButtonManager(scope, cls, guildIdRef, componentIdRef, onChanged) {
+    const linkBtn = scope.querySelector(`.${cls}KindBtn[data-kind="link"]`);
+    const respBtn = scope.querySelector(`.${cls}KindBtn[data-kind="response"]`);
+    const linkForm = scope.querySelector(`.${cls}LinkForm`);
+    const respForm = scope.querySelector(`.${cls}RespForm`);
+    if (linkBtn) linkBtn.onclick = (e) => { e.stopPropagation(); linkForm.style.display = linkForm.style.display === 'none' ? '' : 'none'; respForm.style.display = 'none'; };
+    if (respBtn) respBtn.onclick = (e) => { e.stopPropagation(); respForm.style.display = respForm.style.display === 'none' ? '' : 'none'; linkForm.style.display = 'none'; };
+
+    const linkAdd = scope.querySelector(`.${cls}LinkAdd`);
+    if (linkAdd) linkAdd.onclick = async (e) => {
+      e.stopPropagation();
+      const status = scope.querySelector(`.${cls}LinkStatus`);
+      status.textContent = 'Adding...'; status.className = 'save-status';
+      const body = {
+        kind: 'link',
+        label: scope.querySelector(`.${cls}LinkLabel`).value,
+        url: scope.querySelector(`.${cls}LinkUrl`).value,
+        emoji: scope.querySelector(`.${cls}LinkEmoji`).value,
+      };
+      const res = await api(`/api/guilds/${guildIdRef}/components/${componentIdRef()}/buttons`, { method: 'POST', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (res.ok) { onChanged(data); }
+      else { status.textContent = data.error || 'Failed to add.'; status.className = 'save-status err'; }
+    };
+
+    const respAdd = scope.querySelector(`.${cls}RespAdd`);
+    if (respAdd) respAdd.onclick = async (e) => {
+      e.stopPropagation();
+      const status = scope.querySelector(`.${cls}RespStatus`);
+      status.textContent = 'Adding...'; status.className = 'save-status';
+      const body = {
+        kind: 'response',
+        label: scope.querySelector(`.${cls}RespLabel`).value,
+        emoji: scope.querySelector(`.${cls}RespEmoji`).value,
+        style: scope.querySelector(`.${cls}RespStyle`).value,
+        response_title: scope.querySelector(`.${cls}RespTitle`).value,
+        response_description: scope.querySelector(`.${cls}RespDesc`).value,
+        response_thumbnail: scope.querySelector(`.${cls}RespThumb`).value,
+        response_banner: scope.querySelector(`.${cls}RespBanner`).value,
+      };
+      const res = await api(`/api/guilds/${guildIdRef}/components/${componentIdRef()}/buttons`, { method: 'POST', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (res.ok) { onChanged(data); }
+      else { status.textContent = data.error || 'Failed to add.'; status.className = 'save-status err'; }
+    };
+
+    scope.querySelectorAll(`.${cls}BtnList .btnRemove`).forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const idx = btn.getAttribute('data-idx');
+        const res = await api(`/api/guilds/${guildIdRef}/components/${componentIdRef()}/buttons/${idx}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (res.ok) onChanged(data);
+      };
+    });
+  }
+
+  const compsBadge = comps.components.length ? `${comps.components.length} message${comps.components.length === 1 ? '' : 's'}` : 'No messages yet';
+
+  const compTabsHtml = `<div class="tix-tabs">` +
+    comps.components.map((c, idx) => `<button class="tix-tab" data-tab="comp${idx}"><span class="tix-dot ${c.is_live ? 'on' : 'off'}"></span>${c.id}</button>`).join('') +
+    `<button class="tix-tab tix-tab-new" data-tab="compnew">+ New Message</button></div>`;
+
+  const compExistingPanes = comps.components.map((c, idx) => `
+    <div class="tix-pane" data-pane="comp${idx}">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap;">
+        <span class="mono" style="font-size:13px;color:var(--gold);">${c.id}</span>
+        ${c.is_live ? `<span class="status-badge on" style="font-size:10px;">Live${c.post_channel_name ? ' in #' + c.post_channel_name : ''}</span>` : `<span class="status-badge off" style="font-size:10px;">Not posted</span>`}
+      </div>
+      <div class="tix-layout">
+        <div>${componentPreviewHtml('cx' + idx)}</div>
+        <div>
+          ${componentFieldsHtml('cx' + idx, c)}
+          <div class="save-row">
+            <button class="btn btn-primary cxSave" data-idx="${idx}">Save Settings</button>
+            <span class="save-status cxStatus" data-idx="${idx}"></span>
+          </div>
+          <div class="custom-divider"></div>
+          ${buttonManagerHtml('cx' + idx, c.buttons, comps.max_buttons)}
+          <div class="custom-subhead" style="margin-top:24px;font-size:13.5px;">Post / Move This Message</div>
+          <div class="custom-subnote">Sends this message's current content to the channel below — updates it in place if it's still there, otherwise posts a fresh one.</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <select class="cxPostChannel" data-idx="${idx}" style="flex:1;min-width:180px;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:10px 12px;color:var(--ink);font-family:'Outfit',sans-serif;font-size:14px;">
+              <option value="">— Pick a channel —</option>${chOptions(c.post_channel_id)}
+            </select>
+            <button class="btn btn-gold cxPost" data-idx="${idx}">Post to Channel</button>
+          </div>
+          <span class="save-status cxPostStatus" data-idx="${idx}"></span>
+        </div>
+      </div>
+    </div>
+  `).join('');
+
+  const compNewPane = `
+    <div class="tix-pane" data-pane="compnew">
+      <div class="custom-subnote" style="margin-bottom:18px;">Give it a short ID (e.g. <span class="mono">rules</span>), write your message, pick a channel, and post it. Buttons can be added once it's created.</div>
+      <div class="tix-layout">
+        <div>${componentPreviewHtml('cnew')}</div>
+        <div>
+          <div class="field">
+            <label>Message ID</label>
+            <input type="text" id="compNewId" placeholder="rules" maxlength="32">
+          </div>
+          ${componentFieldsHtml('cnew', null)}
+          <div class="field">
+            <label>Post In Channel</label>
+            <select id="compNewPostChannel"><option value="">— Pick a channel —</option>${chOptions(null)}</select>
+          </div>
+          <div class="save-row">
+            <button class="btn btn-gold" id="compNewPost">Create &amp; Post Message</button>
+            <span class="save-status" id="compNewPostStatus"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const compBody = compTabsHtml + `<div class="tix-panes">` + compExistingPanes + compNewPane + `</div>`;
+
+  const compCard = makePanelPage('components', '<svg viewBox="0 0 24 24" fill="none" stroke="#a80f2c" stroke-width="1.6"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6M9 13h6M9 17h3"/></svg>', 'Message Components', 'Custom messages with link &amp; response buttons', compsBadge, compBody);
+
+  // ---- tab switching ----
+  const compTabBtns = compCard.querySelectorAll('.tix-tab');
+  const compPanes = compCard.querySelectorAll('.tix-pane');
+  function showCompTab(name) {
+    compTabBtns.forEach(b => b.classList.toggle('active', b.getAttribute('data-tab') === name));
+    compPanes.forEach(p => p.classList.toggle('active', p.getAttribute('data-pane') === name));
+  }
+  compTabBtns.forEach(b => { b.onclick = (e) => { e.stopPropagation(); showCompTab(b.getAttribute('data-tab')); }; });
+  showCompTab(comps.components.length ? 'comp0' : 'compnew');
+
+  // ---- existing messages: fields, preview, buttons, save, post ----
+  compCard.querySelectorAll('[data-pane^="comp"]:not([data-pane="compnew"])').forEach((pane, idx) => {
+    const componentId = comps.components[idx].id;
+    let currentButtons = comps.components[idx].buttons;
+    const f = bindComponentFields(pane, 'cx' + idx);
+    const refreshPreview = wireComponentPreview(pane, 'cx' + idx, f, () => currentButtons);
+
+    function rebindButtons() {
+      bindButtonManager(pane, 'cx' + idx, guildId, () => componentId, (data) => {
+        const updated = data.components.find(c => c.id === componentId);
+        currentButtons = updated ? updated.buttons : [];
+        const section = pane.querySelector(`.cx${idx}ButtonSection`);
+        section.outerHTML = buttonManagerHtml('cx' + idx, currentButtons, comps.max_buttons);
+        rebindButtons();
+        refreshPreview();
+      });
+    }
+    rebindButtons();
+
+    pane.querySelector('.cxSave').onclick = async (e) => {
+      e.stopPropagation();
+      const status = pane.querySelector('.cxStatus');
+      status.textContent = 'Saving...'; status.className = 'save-status cxStatus';
+      const body = { title: f.title(), description: f.description(), thumbnail: f.thumbnail(), image: f.image(), color: f.color() };
+      const res = await api(`/api/guilds/${guildId}/components/${componentId}`, { method: 'PATCH', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (res.ok) { status.textContent = 'Saved — live message updated too.'; status.className = 'save-status cxStatus ok'; }
+      else { status.textContent = data.error || 'Failed to save — try again.'; status.className = 'save-status cxStatus err'; }
+    };
+
+    pane.querySelector('.cxPost').onclick = async (e) => {
+      e.stopPropagation();
+      const status = pane.querySelector('.cxPostStatus');
+      const channelSel = pane.querySelector('.cxPostChannel');
+      if (!channelSel.value) { status.textContent = 'Pick a channel first.'; status.className = 'save-status cxPostStatus err'; return; }
+      status.textContent = 'Posting...'; status.className = 'save-status cxPostStatus';
+      const body = { component_id: componentId, post_channel_id: channelSel.value, title: f.title(), description: f.description(), thumbnail: f.thumbnail(), image: f.image(), color: f.color() };
+      const res = await api(`/api/guilds/${guildId}/components`, { method: 'POST', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (res.ok) { status.textContent = 'Posted.'; status.className = 'save-status cxPostStatus ok'; setTimeout(() => renderGuildEditor(guildId, me), 700); }
+      else { status.textContent = data.error || 'Failed to post — try again.'; status.className = 'save-status cxPostStatus err'; }
+    };
+  });
+
+  // ---- new message: fields, preview, create (buttons added after creation) ----
+  (function bindNewComponent() {
+    const newPaneEl = compCard.querySelector('[data-pane="compnew"]');
+    const f = bindComponentFields(newPaneEl, 'cnew');
+    wireComponentPreview(newPaneEl, 'cnew', f, () => []);
+    newPaneEl.querySelector('#compNewPost').onclick = async (e) => {
+      e.stopPropagation();
+      const status = newPaneEl.querySelector('#compNewPostStatus');
+      const idInput = newPaneEl.querySelector('#compNewId');
+      const channelSel = newPaneEl.querySelector('#compNewPostChannel');
+      if (!idInput.value.trim()) { status.textContent = 'Give the message an ID.'; status.className = 'save-status err'; return; }
+      if (!channelSel.value) { status.textContent = 'Pick a channel to post in.'; status.className = 'save-status err'; return; }
+      status.textContent = 'Posting...'; status.className = 'save-status';
+      const body = { component_id: idInput.value.trim(), post_channel_id: channelSel.value, title: f.title(), description: f.description(), thumbnail: f.thumbnail(), image: f.image(), color: f.color() };
+      const res = await api(`/api/guilds/${guildId}/components`, { method: 'POST', body: JSON.stringify(body) });
+      const data = await res.json();
+      if (res.ok) { status.textContent = 'Posted! Reloading...'; status.className = 'save-status ok'; setTimeout(() => renderGuildEditor(guildId, me), 700); }
+      else { status.textContent = data.error || 'Failed to post — try again.'; status.className = 'save-status err'; }
+    };
+  })();
+
   // ---------------- Sidebar registration + default view ----------------
   addSidebarItem('leveling', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>', 'Level & XP', lvl.enabled ? 'on' : 'off');
   addSidebarItem('antinuke', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>', 'Anti-Nuke', an.enabled ? 'on' : 'off');
   addSidebarItem('antispam', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>', 'Antispam', 'neutral');
   addSidebarItem('tickets', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M4 10h16"/></svg>', 'Ticket System', tix.panels.length ? 'on' : 'off');
+  addSidebarItem('components', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6M9 13h6M9 17h3"/></svg>', 'Message Components', comps.components.length ? 'on' : 'off');
   sidebarNav.appendChild(el(`<div class="sidebar-divider"></div>`));
   addSidebarComingSoon('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z"/></svg>', 'Moderation');
   addSidebarComingSoon('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M9 12l2 2 4-4M7.5 3.5L12 2l4.5 1.5L18 8l-1 8-5 4-5-4-1-8z"/></svg>', 'Verification');

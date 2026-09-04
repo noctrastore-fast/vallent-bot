@@ -1248,6 +1248,189 @@ async def start_vote_webhook_server():
                 bot.add_view(TicketPanelLayout(panel_id, panel, guild=guild))
                 return None
 
+            def _get_components(guild_id: int) -> dict:
+                gc = guild_cfg(cfg, guild_id)
+                guild = bot.get_guild(guild_id)
+                comps = []
+                for cid, c in gc["message_components"].items():
+                    post_ch = guild.get_channel(c.get("channel_id")) if guild and c.get("channel_id") else None
+                    color_int = c.get("color") or COLOR_PRIMARY
+                    buttons = []
+                    for i, b in enumerate(c.get("buttons") or []):
+                        is_link = b.get("kind") == "link"
+                        buttons.append({
+                            "index": i,
+                            "kind": b.get("kind"),
+                            "label": b.get("label") or "",
+                            "url": b.get("url") if is_link else None,
+                            "emoji": b.get("emoji") or "",
+                            "style": b.get("style") if not is_link else None,
+                            "response_title": b.get("response_title") if not is_link else None,
+                            "response_description": b.get("response_description") if not is_link else None,
+                            "response_thumbnail": b.get("response_thumbnail") if not is_link else None,
+                            "response_banner": b.get("response_banner") if not is_link else None,
+                            "description": message_components.describe_button(b),
+                        })
+                    comps.append({
+                        "id": cid,
+                        "title": c.get("title") or "",
+                        "description": c.get("description") or "",
+                        "thumbnail": c.get("thumbnail") or "",
+                        "image": c.get("image") or "",
+                        "color": f"{color_int:06X}",
+                        "buttons": buttons,
+                        "is_live": bool(c.get("message_id") and c.get("channel_id")),
+                        "post_channel_id": str(c["channel_id"]) if c.get("channel_id") else None,
+                        "post_channel_name": post_ch.name if post_ch else None,
+                    })
+                comps.sort(key=lambda x: x["id"])
+                return {"components": comps, "max_buttons": message_components.MAX_BUTTONS}
+
+            def _apply_component_fields(comp: dict, fields: dict) -> Optional[str]:
+                if "title" in fields:
+                    comp["title"] = (fields.get("title") or "").strip()[:256] or None
+                if "description" in fields:
+                    comp["description"] = (fields.get("description") or "").strip()[:4000]
+                if "thumbnail" in fields:
+                    url = (fields.get("thumbnail") or "").strip()
+                    if url and not url.startswith(("http://", "https://")):
+                        return "Thumbnail must be a direct image URL."
+                    comp["thumbnail"] = url or None
+                if "image" in fields:
+                    url = (fields.get("image") or "").strip()
+                    if url and not url.startswith(("http://", "https://")):
+                        return "Banner must be a direct image URL."
+                    comp["image"] = url or None
+                if "color" in fields:
+                    raw = (fields.get("color") or "").strip()
+                    if raw:
+                        parsed = parse_hex_color(raw)
+                        if not parsed:
+                            return "That doesn't look like a valid hex color."
+                        comp["color"] = int(raw.lstrip("#"), 16)
+                    else:
+                        comp["color"] = COLOR_PRIMARY
+                return None
+
+            def _refresh_component_live(guild_id: int, component_id: str, comp: dict) -> None:
+                if not (comp.get("message_id") and comp.get("channel_id")):
+                    return
+                guild = bot.get_guild(guild_id)
+                if not guild:
+                    return
+
+                async def _refresh():
+                    try:
+                        channel = guild.get_channel(comp["channel_id"]) or await guild.fetch_channel(comp["channel_id"])
+                        message = await channel.fetch_message(comp["message_id"])
+                        await message.edit(view=MessageComponentLayout(component_id, comp))
+                    except Exception:
+                        logging.warning(f"Failed to refresh live component message '{component_id}' after a dashboard edit", exc_info=True)
+
+                asyncio.create_task(_refresh())
+
+            def _set_component(guild_id: int, component_id: str, update: dict) -> Optional[str]:
+                gc = guild_cfg(cfg, guild_id)
+                comps = gc["message_components"]
+                if component_id not in comps:
+                    return "That message doesn't exist — create it below."
+                comp = comps[component_id]
+                err = _apply_component_fields(comp, update)
+                if err:
+                    return err
+                save_config(cfg)
+                _refresh_component_live(guild_id, component_id, comp)
+                return None
+
+            async def _send_component(guild_id: int, component_id: str, fields: dict, post_channel_id: int) -> Optional[str]:
+                """Same mechanics as _send_ticket_panel: edits the existing live
+                message in place if it's still there, otherwise posts fresh."""
+                component_id = (component_id or "").lower().strip()
+                if not re.fullmatch(r"[a-z0-9_-]{1,32}", component_id):
+                    return "Message ID can only use lowercase letters, numbers, - and _ (max 32 characters)."
+                guild = bot.get_guild(guild_id)
+                if not guild:
+                    return "Couldn't find that server right now — try again in a moment."
+                post_channel = guild.get_channel(post_channel_id)
+                if not post_channel:
+                    return "Couldn't find that channel to post the message in."
+
+                gc = guild_cfg(cfg, guild_id)
+                comps = gc["message_components"]
+                comp = comps.setdefault(component_id, {})
+                err = _apply_component_fields(comp, fields)
+                if err:
+                    return err
+                if not comp.get("title") and not comp.get("description"):
+                    return "Set a title or description first."
+
+                old_channel_id = comp.get("channel_id")
+                old_message_id = comp.get("message_id")
+                edited_existing = False
+                if old_channel_id and old_message_id:
+                    old_channel = guild.get_channel(old_channel_id)
+                    if old_channel:
+                        try:
+                            old_msg = await old_channel.fetch_message(old_message_id)
+                            await old_msg.edit(view=MessageComponentLayout(component_id, comp))
+                            edited_existing = True
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            edited_existing = False
+
+                if not edited_existing:
+                    try:
+                        msg = await post_channel.send(view=MessageComponentLayout(component_id, comp))
+                    except discord.Forbidden:
+                        return "I don't have permission to send messages in that channel."
+                    except discord.HTTPException as ex:
+                        return f"Discord rejected the message: {ex}"
+                    comp["message_id"], comp["channel_id"] = msg.id, post_channel.id
+
+                save_config(cfg)
+                bot.add_view(MessageComponentLayout(component_id, comp))
+                return None
+
+            def _add_component_button(guild_id: int, component_id: str, button_fields: dict) -> Optional[str]:
+                gc = guild_cfg(cfg, guild_id)
+                comps = gc["message_components"]
+                if component_id not in comps:
+                    return "That message doesn't exist yet — create it first."
+                comp = comps[component_id]
+                buttons = comp.setdefault("buttons", [])
+                kind = button_fields.get("kind")
+                if kind == "link":
+                    err = message_components.add_link_button(
+                        buttons, button_fields.get("label", ""), button_fields.get("url", ""), button_fields.get("emoji", ""),
+                    )
+                elif kind == "response":
+                    err = message_components.add_response_button(
+                        buttons, button_fields.get("label", ""), button_fields.get("response_title", ""),
+                        button_fields.get("response_description", ""), button_fields.get("emoji", ""),
+                        button_fields.get("style", "secondary"), button_fields.get("response_thumbnail", ""),
+                        button_fields.get("response_banner", ""),
+                    )
+                else:
+                    return "Invalid button kind."
+                if err:
+                    return err
+                save_config(cfg)
+                _refresh_component_live(guild_id, component_id, comp)
+                return None
+
+            def _remove_component_button(guild_id: int, component_id: str, index: int) -> Optional[str]:
+                gc = guild_cfg(cfg, guild_id)
+                comps = gc["message_components"]
+                if component_id not in comps:
+                    return "That message doesn't exist."
+                comp = comps[component_id]
+                buttons = comp.get("buttons", [])
+                removed = message_components.remove_button(buttons, index)
+                if removed is None:
+                    return "That button no longer exists — the list may have changed."
+                save_config(cfg)
+                _refresh_component_live(guild_id, component_id, comp)
+                return None
+
             def _get_antinuke(guild_id: int) -> dict:
                 gc = guild_cfg(cfg, guild_id)
                 ac = gc.get("antinuke", {})
@@ -1518,6 +1701,11 @@ async def start_vote_webhook_server():
                 get_tickets=_get_tickets,
                 set_ticket_panel=_set_ticket_panel,
                 send_ticket_panel=_send_ticket_panel,
+                get_components=_get_components,
+                set_component=_set_component,
+                send_component=_send_component,
+                add_component_button=_add_component_button,
+                remove_component_button=_remove_component_button,
                 get_antinuke=_get_antinuke,
                 set_antinuke=_set_antinuke,
                 add_antinuke_whitelist=_add_antinuke_whitelist,
