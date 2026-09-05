@@ -387,6 +387,17 @@ def build_dashboard_routes(
         cats.sort(key=lambda c: c["name"].lower())
         return web.json_response(cats)
 
+    async def api_guild_emojis(request: web.Request) -> web.Response:
+        guild_id = request.match_info["guild_id"]
+        _, err = _require_guild_access(request, guild_id)
+        if err:
+            return err
+        bot = get_bot()
+        guild = bot.get_guild(int(guild_id))
+        emojis = [{"id": str(e.id), "name": e.name, "animated": e.animated, "url": str(e.url), "tag": f"<{'a' if e.animated else ''}:{e.name}:{e.id}>"} for e in guild.emojis]
+        emojis.sort(key=lambda e: e["name"].lower())
+        return web.json_response(emojis)
+
     async def api_get_tickets(request: web.Request) -> web.Response:
         guild_id = request.match_info["guild_id"]
         _, err = _require_guild_access(request, guild_id)
@@ -889,6 +900,7 @@ def build_dashboard_routes(
     app.router.add_get("/api/guilds/{guild_id}/channels", api_guild_channels)
     app.router.add_get("/api/guilds/{guild_id}/roles", api_guild_roles)
     app.router.add_get("/api/guilds/{guild_id}/categories", api_guild_categories)
+    app.router.add_get("/api/guilds/{guild_id}/emojis", api_guild_emojis)
     app.router.add_get("/api/guilds/{guild_id}/tickets", api_get_tickets)
     app.router.add_post("/api/guilds/{guild_id}/tickets", api_post_ticket_panel)
     app.router.add_patch("/api/guilds/{guild_id}/tickets/{panel_id}", api_patch_ticket_panel)
@@ -1080,6 +1092,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .field select:focus, .field input:focus, .field textarea:focus{ border-color:var(--crimson); }
   .field-row{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }
   @media (max-width:520px){ .field-row{ grid-template-columns:1fr; } }
+
+  /* ---------- Emoji picker ---------- */
+  .emoji-field{ display:flex; gap:8px; }
+  .emoji-field input{ flex:1; }
+  .emoji-pick-btn{ width:44px; height:44px; flex-shrink:0; border-radius:6px; border:1px solid var(--line); background:var(--surface-2); cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center; transition:border-color .18s ease; }
+  .emoji-pick-btn:hover{ border-color:var(--line-2); }
+  .emoji-pick-btn img{ width:20px; height:20px; }
+  .emoji-popover{ position:fixed; z-index:300; width:290px; max-height:340px; overflow-y:auto; background:var(--surface); border:1px solid var(--line-2); border-radius:10px; box-shadow:var(--shadow-lg); padding:14px; display:none; }
+  .emoji-popover.open{ display:block; }
+  .emoji-popover h6{ font-size:10.5px; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted-2); font-weight:600; margin:12px 0 8px; }
+  .emoji-popover h6:first-child{ margin-top:0; }
+  .emoji-grid{ display:grid; grid-template-columns:repeat(7,1fr); gap:3px; }
+  .emoji-grid button{ background:transparent; border:none; border-radius:6px; padding:6px 0; cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center; transition:background .15s ease; }
+  .emoji-grid button:hover{ background:var(--surface-2); }
+  .emoji-grid img{ width:20px; height:20px; }
+  .emoji-clear-btn{ font-size:11px; color:var(--muted-2); background:transparent; border:none; cursor:pointer; padding:2px 0; }
+  .emoji-clear-btn:hover{ color:var(--ink); }
+  .emoji-popover-empty{ font-size:11.5px; color:var(--muted-2); line-height:1.5; }
   .toggle{ position:relative; display:inline-block; width:46px; height:26px; }
   .toggle input{ opacity:0; width:0; height:0; }
   .toggle-slider{ position:absolute; inset:0; background:var(--surface-2); border:1px solid var(--line); border-radius:14px; cursor:pointer; transition:.2s; }
@@ -1234,6 +1264,80 @@ function el(html){ const t = document.createElement('template'); t.innerHTML = h
 async function api(path, opts={}) {
   const res = await fetch(path, { credentials: 'same-origin', headers: {'X-Requested-With':'vallent-dashboard','Content-Type':'application/json'}, ...opts });
   return res;
+}
+
+// ---------------- Shared emoji picker ----------------
+// One popover reused everywhere an emoji field shows up (ticket buttons,
+// component buttons, etc) — pulls the actual server's custom emoji list
+// (passed in per-call) alongside a curated set of common unicode emoji,
+// so people aren't stuck typing/pasting emoji codes by hand.
+const COMMON_EMOJIS = ['🎫','💬','✅','❌','⚠️','🔒','🔓','📋','📌','🛠️','💰','🎉','🔗','📢','👋','🙋','❓','📝','🚀','⭐','🔔','📦','🎁','🛡️','⚡','🔥','💡','📎','🗑️','➕'];
+let _emojiPopover = null;
+let _emojiPopoverTarget = null;
+
+function _ensureEmojiPopover() {
+  if (_emojiPopover) return _emojiPopover;
+  _emojiPopover = el(`<div class="emoji-popover"></div>`);
+  document.body.appendChild(_emojiPopover);
+  document.addEventListener('click', (e) => {
+    if (_emojiPopover.classList.contains('open') && !_emojiPopover.contains(e.target) && !e.target.closest('.emoji-pick-btn')) {
+      _emojiPopover.classList.remove('open');
+    }
+  });
+  window.addEventListener('scroll', () => _emojiPopover.classList.remove('open'), true);
+  return _emojiPopover;
+}
+
+function attachEmojiPicker(inputEl, customEmojis) {
+  const wrap = el(`<div class="emoji-field"></div>`);
+  inputEl.parentNode.insertBefore(wrap, inputEl);
+  wrap.appendChild(inputEl);
+  const pickBtn = el(`<button type="button" class="emoji-pick-btn" title="Pick an emoji">🙂</button>`);
+  wrap.appendChild(pickBtn);
+
+  function updatePickBtnFace() {
+    const v = (inputEl.value || '').trim();
+    const custom = customEmojis.find(e => e.tag === v);
+    pickBtn.innerHTML = custom ? `<img src="${custom.url}">` : (v && !v.startsWith('<') ? v : '🙂');
+  }
+  updatePickBtnFace();
+  inputEl.addEventListener('input', updatePickBtnFace);
+
+  pickBtn.onclick = (e) => {
+    e.stopPropagation();
+    const pop = _ensureEmojiPopover();
+    if (pop.classList.contains('open') && _emojiPopoverTarget === inputEl) { pop.classList.remove('open'); return; }
+    _emojiPopoverTarget = inputEl;
+    pop.innerHTML = '';
+    pop.appendChild(el(`<h6>Common</h6>`));
+    const commonGrid = el(`<div class="emoji-grid"></div>`);
+    COMMON_EMOJIS.forEach(em => {
+      const b = el(`<button type="button">${em}</button>`);
+      b.onclick = () => { inputEl.value = em; inputEl.dispatchEvent(new Event('input')); pop.classList.remove('open'); };
+      commonGrid.appendChild(b);
+    });
+    pop.appendChild(commonGrid);
+    pop.appendChild(el(`<h6>This Server</h6>`));
+    if (customEmojis.length) {
+      const customGrid = el(`<div class="emoji-grid"></div>`);
+      customEmojis.forEach(ce => {
+        const b = el(`<button type="button" title=":${ce.name}:"><img src="${ce.url}"></button>`);
+        b.onclick = () => { inputEl.value = ce.tag; inputEl.dispatchEvent(new Event('input')); pop.classList.remove('open'); };
+        customGrid.appendChild(b);
+      });
+      pop.appendChild(customGrid);
+    } else {
+      pop.appendChild(el(`<div class="emoji-popover-empty">No custom emoji on this server yet.</div>`));
+    }
+    const clearBtn = el(`<button type="button" class="emoji-clear-btn">Clear emoji</button>`);
+    clearBtn.onclick = () => { inputEl.value = ''; inputEl.dispatchEvent(new Event('input')); pop.classList.remove('open'); };
+    pop.appendChild(clearBtn);
+
+    const r = pickBtn.getBoundingClientRect();
+    pop.style.top = Math.min(r.bottom + 6, window.innerHeight - 350) + 'px';
+    pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 300)) + 'px';
+    pop.classList.add('open');
+  };
 }
 
 function renderNav(me) {
@@ -1556,7 +1660,7 @@ function setBadge(card, enabled) {
 
 async function renderGuildEditor(guildId, me) {
   app.innerHTML = '<div class="loading">Loading server settings…</div>';
-  const [lvlRes, chRes, rolesRes, catRes, anRes, asRes, tixRes, compRes] = await Promise.all([
+  const [lvlRes, chRes, rolesRes, catRes, anRes, asRes, tixRes, compRes, emojiRes] = await Promise.all([
     api(`/api/guilds/${guildId}/leveling`),
     api(`/api/guilds/${guildId}/channels`),
     api(`/api/guilds/${guildId}/roles`),
@@ -1565,6 +1669,7 @@ async function renderGuildEditor(guildId, me) {
     api(`/api/guilds/${guildId}/antispam`),
     api(`/api/guilds/${guildId}/tickets`),
     api(`/api/guilds/${guildId}/components`),
+    api(`/api/guilds/${guildId}/emojis`),
   ]);
   if (lvlRes.status === 403 || lvlRes.status === 404) {
     app.innerHTML = `<div class="loading">You don't have access to manage this server.</div>`;
@@ -1578,6 +1683,7 @@ async function renderGuildEditor(guildId, me) {
   const as_ = await asRes.json();
   const tix = await tixRes.json();
   const comps = await compRes.json();
+  const guildEmojis = emojiRes.ok ? await emojiRes.json() : [];
   const guildMeta = (me && me.guilds || []).find(g => g.id === guildId);
 
   app.innerHTML = '';
@@ -2117,6 +2223,7 @@ async function renderGuildEditor(guildId, me) {
     const colorText = scope.querySelector(`.${cls}Color`);
     colorPick.oninput = () => { colorText.value = colorPick.value.replace('#','').toUpperCase(); colorText.dispatchEvent(new Event('input')); };
     colorText.addEventListener('input', () => { const v = colorText.value.replace('#','').trim(); if (/^[0-9A-Fa-f]{6}$/.test(v)) colorPick.value = '#' + v; });
+    attachEmojiPicker(scope.querySelector(`.${cls}Emoji`), guildEmojis);
     return {
       title: () => scope.querySelector(`.${cls}Title`).value,
       description: () => scope.querySelector(`.${cls}Desc`).value,
@@ -2452,6 +2559,8 @@ async function renderGuildEditor(guildId, me) {
     const respForm = scope.querySelector(`.${cls}RespForm`);
     if (linkBtn) linkBtn.onclick = (e) => { e.stopPropagation(); linkForm.style.display = linkForm.style.display === 'none' ? '' : 'none'; respForm.style.display = 'none'; };
     if (respBtn) respBtn.onclick = (e) => { e.stopPropagation(); respForm.style.display = respForm.style.display === 'none' ? '' : 'none'; linkForm.style.display = 'none'; };
+    attachEmojiPicker(scope.querySelector(`.${cls}LinkEmoji`), guildEmojis);
+    attachEmojiPicker(scope.querySelector(`.${cls}RespEmoji`), guildEmojis);
 
     const linkAdd = scope.querySelector(`.${cls}LinkAdd`);
     if (linkAdd) linkAdd.onclick = async (e) => {
